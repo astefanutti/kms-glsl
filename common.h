@@ -160,11 +160,12 @@ static inline int __egl_check(void *ptr, const char *name)
 
 #define egl_check(egl, name) __egl_check((egl)->name, #name)
 
-int init_egl(struct egl *egl, const struct gbm *gbm);
+const struct egl * init_egl(const struct gbm *gbm);
+
 int create_program(const char *vs_src, const char *fs_src);
 int link_program(unsigned program);
 
-const struct egl * init_shadertoy(const struct gbm *gbm, const char *shadertoy);
+int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *shadertoy);
 
 void init_perfcntrs(const struct egl *egl, const char *perfcntrs);
 void start_perfcntrs(void);

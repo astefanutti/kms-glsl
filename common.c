@@ -35,19 +35,20 @@
 #include "common.h"
 
 static struct gbm gbm;
+static struct egl egl;
 
 WEAK struct gbm_surface *
 gbm_surface_create_with_modifiers(struct gbm_device *gbm,
-                                  uint32_t width, uint32_t height,
-                                  uint32_t format,
-                                  const uint64_t *modifiers,
-                                  const unsigned int count);
+				uint32_t width, uint32_t height,
+				uint32_t format,
+				const uint64_t *modifiers,
+				const unsigned int count);
 WEAK struct gbm_bo *
 gbm_bo_create_with_modifiers(struct gbm_device *gbm,
-                             uint32_t width, uint32_t height,
-                             uint32_t format,
-                             const uint64_t *modifiers,
-                             const unsigned int count);
+				uint32_t width, uint32_t height,
+				uint32_t format,
+				const uint64_t *modifiers,
+				const unsigned int count);
 
 static struct gbm_bo * init_bo(uint64_t modifier)
 {
@@ -55,9 +56,9 @@ static struct gbm_bo * init_bo(uint64_t modifier)
 
 	if (gbm_bo_create_with_modifiers) {
 		bo = gbm_bo_create_with_modifiers(gbm.dev,
-						  gbm.width, gbm.height,
-						  gbm.format,
-						  &modifier, 1);
+						gbm.width, gbm.height,
+						gbm.format,
+						&modifier, 1);
 	}
 
 	if (!bo) {
@@ -67,9 +68,9 @@ static struct gbm_bo * init_bo(uint64_t modifier)
 		}
 
 		bo = gbm_bo_create(gbm.dev,
-				   gbm.width, gbm.height,
-				   gbm.format,
-				   GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+				gbm.width, gbm.height,
+				gbm.format,
+				GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 	}
 
 	if (!bo) {
@@ -113,7 +114,7 @@ static struct gbm * init_surface(uint64_t modifier)
 	}
 
 	if (!gbm.surface) {
-		printf("failed to create gbm surface\n");
+		printf("failed to create GBM surface\n");
 		return NULL;
 	}
 
@@ -158,9 +159,9 @@ static bool has_ext(const char *extension_list, const char *ext)
 
 static int
 match_config_to_visual(EGLDisplay egl_display,
-		       EGLint visual_id,
-		       EGLConfig *configs,
-		       int count)
+			EGLint visual_id,
+			EGLConfig *configs,
+			int count)
 {
 	int i;
 
@@ -181,7 +182,7 @@ match_config_to_visual(EGLDisplay egl_display,
 
 static bool
 egl_choose_config(EGLDisplay egl_display, const EGLint *attribs,
-                  EGLint visual_id, EGLConfig *config_out)
+				EGLint visual_id, EGLConfig *config_out)
 {
 	EGLint count = 0;
 	EGLint matched = 0;
@@ -197,7 +198,7 @@ egl_choose_config(EGLDisplay egl_display, const EGLint *attribs,
 		return false;
 
 	if (!eglChooseConfig(egl_display, attribs, configs,
-			      count, &matched) || !matched) {
+					count, &matched) || !matched) {
 		printf("No EGL configs with appropriate attributes.\n");
 		goto out;
 	}
@@ -207,9 +208,9 @@ egl_choose_config(EGLDisplay egl_display, const EGLint *attribs,
 
 	if (config_index == -1)
 		config_index = match_config_to_visual(egl_display,
-						      visual_id,
-						      configs,
-						      matched);
+							visual_id,
+							configs,
+							matched);
 
 	if (config_index != -1)
 		*config_out = configs[config_index];
@@ -253,10 +254,10 @@ create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
 		if (modifier != DRM_FORMAT_MOD_LINEAR) {
 			size_t attrs_index = 12;
 			khr_image_attrs[attrs_index++] =
-			    EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
+				EGL_DMA_BUF_PLANE0_MODIFIER_LO_EXT;
 			khr_image_attrs[attrs_index++] = modifier & 0xfffffffful;
 			khr_image_attrs[attrs_index++] =
-			    EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
+				EGL_DMA_BUF_PLANE0_MODIFIER_HI_EXT;
 			khr_image_attrs[attrs_index++] = modifier >> 32;
 		}
 	}
@@ -270,10 +271,10 @@ create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
 		return false;
 	}
 
-	// EGLImage takes the fd ownership.
+	// EGLImage takes the fd ownership
 	close(fd);
 
-	// 2. Create GL texture and framebuffer.
+	// 2. Create GL texture and framebuffer
 	glGenTextures(1, &fb->tex);
 	glBindTexture(GL_TEXTURE_2D, fb->tex);
 	egl->glEGLImageTargetTexture2DOES(GL_TEXTURE_2D, fb->image);
@@ -298,7 +299,7 @@ create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
 	return true;
 }
 
-int init_egl(struct egl *egl, const struct gbm *gbm)
+const struct egl * init_egl(const struct gbm *gbm)
 {
 	EGLint major, minor;
 
@@ -320,34 +321,34 @@ int init_egl(struct egl *egl, const struct gbm *gbm)
 
 #define get_proc_client(ext, name) do { \
 		if (has_ext(egl_exts_client, #ext)) \
-			egl->name = (void *)eglGetProcAddress(#name); \
+			egl.name = (void *)eglGetProcAddress(#name); \
 	} while (0)
 #define get_proc_dpy(ext, name) do { \
 		if (has_ext(egl_exts_dpy, #ext)) \
-			egl->name = (void *)eglGetProcAddress(#name); \
+			egl.name = (void *)eglGetProcAddress(#name); \
 	} while (0)
 
 #define get_proc_gl(ext, name) do { \
 		if (has_ext(gl_exts, #ext)) \
-			egl->name = (void *)eglGetProcAddress(#name); \
+			egl.name = (void *)eglGetProcAddress(#name); \
 	} while (0)
 
 	egl_exts_client = eglQueryString(EGL_NO_DISPLAY, EGL_EXTENSIONS);
 	get_proc_client(EGL_EXT_platform_base, eglGetPlatformDisplayEXT);
 
-	if (egl->eglGetPlatformDisplayEXT) {
-		egl->display = egl->eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR,
+	if (egl.eglGetPlatformDisplayEXT) {
+		egl.display = egl.eglGetPlatformDisplayEXT(EGL_PLATFORM_GBM_KHR,
 				gbm->dev, NULL);
 	} else {
-		egl->display = eglGetDisplay((void *)gbm->dev);
+		egl.display = eglGetDisplay((void *)gbm->dev);
 	}
 
-	if (!eglInitialize(egl->display, &major, &minor)) {
+	if (!eglInitialize(egl.display, &major, &minor)) {
 		printf("failed to initialize\n");
-		return -1;
+		return NULL;
 	}
 
-	egl_exts_dpy = eglQueryString(egl->display, EGL_EXTENSIONS);
+	egl_exts_dpy = eglQueryString(egl.display, EGL_EXTENSIONS);
 	get_proc_dpy(EGL_KHR_image_base, eglCreateImageKHR);
 	get_proc_dpy(EGL_KHR_image_base, eglDestroyImageKHR);
 	get_proc_dpy(EGL_KHR_fence_sync, eglCreateSyncKHR);
@@ -356,51 +357,51 @@ int init_egl(struct egl *egl, const struct gbm *gbm)
 	get_proc_dpy(EGL_KHR_fence_sync, eglClientWaitSyncKHR);
 	get_proc_dpy(EGL_ANDROID_native_fence_sync, eglDupNativeFenceFDANDROID);
 
-	egl->modifiers_supported = has_ext(egl_exts_dpy,
-					   "EGL_EXT_image_dma_buf_import_modifiers");
+	egl.modifiers_supported = has_ext(egl_exts_dpy,
+					"EGL_EXT_image_dma_buf_import_modifiers");
 
 	printf("Using display %p with EGL version %d.%d\n",
-			egl->display, major, minor);
+			egl.display, major, minor);
 
 	printf("===================================\n");
 	printf("EGL information:\n");
-	printf("  version: \"%s\"\n", eglQueryString(egl->display, EGL_VERSION));
-	printf("  vendor: \"%s\"\n", eglQueryString(egl->display, EGL_VENDOR));
+	printf("  version: \"%s\"\n", eglQueryString(egl.display, EGL_VERSION));
+	printf("  vendor: \"%s\"\n", eglQueryString(egl.display, EGL_VENDOR));
 	printf("  client extensions: \"%s\"\n", egl_exts_client);
 	printf("  display extensions: \"%s\"\n", egl_exts_dpy);
 	printf("===================================\n");
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
 		printf("failed to bind api EGL_OPENGL_ES_API\n");
-		return -1;
+		return NULL;
 	}
 
-	if (!egl_choose_config(egl->display, config_attribs, gbm->format,
-                               &egl->config)) {
+	if (!egl_choose_config(egl.display, config_attribs, gbm->format,
+			&egl.config)) {
 		printf("failed to choose config\n");
-		return -1;
+		return NULL;
 	}
 
-	egl->context = eglCreateContext(egl->display, egl->config,
+	egl.context = eglCreateContext(egl.display, egl.config,
 			EGL_NO_CONTEXT, context_attribs);
-	if (egl->context == NULL) {
+	if (egl.context == NULL) {
 		printf("failed to create context\n");
-		return -1;
+		return NULL;
 	}
 
 	if (!gbm->surface) {
-		egl->surface = EGL_NO_SURFACE;
+		egl.surface = EGL_NO_SURFACE;
 	} else {
-		egl->surface = eglCreateWindowSurface(egl->display, egl->config,
+		egl.surface = eglCreateWindowSurface(egl.display, egl.config,
 				(EGLNativeWindowType)gbm->surface, NULL);
-		if (egl->surface == EGL_NO_SURFACE) {
-			printf("failed to create egl surface\n");
-			return -1;
+		if (egl.surface == EGL_NO_SURFACE) {
+			printf("failed to create EGL surface\n");
+			return NULL;
 		}
 	}
 
 	/* connect the context to the surface */
-	eglMakeCurrent(egl->display, egl->surface, egl->surface, egl->context);
+	eglMakeCurrent(egl.display, egl.surface, egl.surface, egl.context);
 
 	gl_exts = (char *) glGetString(GL_EXTENSIONS);
 	printf("OpenGL ES 2.x information:\n");
@@ -427,14 +428,14 @@ int init_egl(struct egl *egl, const struct gbm *gbm)
 
 	if (!gbm->surface) {
 		for (unsigned i = 0; i < ARRAY_SIZE(gbm->bos); i++) {
-			if (!create_framebuffer(egl, gbm->bos[i], &egl->fbs[i])) {
+			if (!create_framebuffer(&egl, gbm->bos[i], &egl.fbs[i])) {
 				printf("failed to create framebuffer\n");
-				return -1;
+				return NULL;
 			}
 		}
 	}
 
-	return 0;
+	return &egl;
 }
 
 int create_program(const char *vs_src, const char *fs_src)

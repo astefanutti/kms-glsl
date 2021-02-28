@@ -38,13 +38,7 @@
 
 #include "common.h"
 
-static struct {
-	struct egl egl;
-	const struct gbm *gbm;
-	GLuint program;
-	GLint time_loc;
-	GLuint vbo;
-} gl;
+GLint iTime;
 
 static const char *shadertoy_vs =
 		"attribute vec3 position;                \n"
@@ -56,13 +50,12 @@ static const char *shadertoy_vs =
 static const char *shadertoy_fs_tmpl =
 		"precision mediump float;                                                             \n"
 		"uniform vec3      iResolution;           // viewport resolution (in pixels)          \n"
-		"uniform float     iGlobalTime;           // shader playback time (in seconds)        \n"
+		"uniform float     iTime;                 // shader playback time (in seconds)        \n"
 		"uniform vec4      iMouse;                // mouse pixel coords                       \n"
 		"uniform vec4      iDate;                 // (year, month, day, time in seconds)      \n"
 		"uniform float     iSampleRate;           // sound sample rate (i.e., 44100)          \n"
 		"uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)           \n"
 		"uniform float     iChannelTime[4];       // channel playback time (in sec)           \n"
-		"uniform float     iTime;                                                             \n"
 		"                                                                                     \n"
 		"%s                                                                                   \n"
 		"                                                                                     \n"
@@ -82,7 +75,7 @@ static const GLfloat vertices[] = {
 		1.0f, 1.0f,
 };
 
-static int load_shader(const char *file) {
+static char *load_shader(const char *file) {
 	struct stat statbuf;
 	char *frag;
 	int fd, ret;
@@ -98,63 +91,56 @@ static int load_shader(const char *file) {
 	}
 
 	const char *text = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-
 	asprintf(&frag, shadertoy_fs_tmpl, text);
 
-	return create_program(shadertoy_vs, frag);
+	return frag;
 }
 
 static void draw_shadertoy(unsigned i) {
-	glUseProgram(gl.program);
-
-	glUniform1f(gl.time_loc, (float) i / 60.0f);
-
-	glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
-	glEnableVertexAttribArray(0);
+	glUniform1f(iTime, (float) i / 60.0f);
 
 	start_perfcntrs();
 
 	glDrawArrays(GL_TRIANGLES, 0, 6);
 
 	end_perfcntrs();
-
-	glDisableVertexAttribArray(0);
 }
 
-const struct egl *init_shadertoy(const struct gbm *gbm, const char *file) {
+int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 	int ret;
+	char *shadertoy_fs;
+	GLuint program, vbo;
+	GLint iResolution;
 
-	ret = init_egl(&gl.egl, gbm);
-	if (ret)
-		return NULL;
+	shadertoy_fs = load_shader(file);
 
-	gl.gbm = gbm;
+	ret = create_program(shadertoy_vs, shadertoy_fs);
+	if (ret < 0) {
+		printf("failed to create program\n");
+		return -1;
+	}
+
+	program = ret;
+
+	ret = link_program(program);
+	if (ret) {
+		printf("failed to link program\n");
+		return -1;
+	}
 
 	glViewport(0, 0, gbm->width, gbm->height);
-
-	ret = load_shader(file);
-	if (ret < 0) {
-		return NULL;
-	}
-
-	gl.program = ret;
-
-	ret = link_program(gl.program);
-	if (ret) {
-		return NULL;
-	}
-
-	glUseProgram(gl.program);
-	gl.time_loc = glGetUniformLocation(gl.program, "iTime");
-	GLint resolution_location = glGetUniformLocation(gl.program, "iResolution");
-	glUniform3f(resolution_location, gl.gbm->width, gl.gbm->height, 0);
-	glGenBuffers(1, &gl.vbo);
-	glBindBuffer(GL_ARRAY_BUFFER, gl.vbo);
+	glUseProgram(program);
+	iTime = glGetUniformLocation(program, "iTime");
+	iResolution = glGetUniformLocation(program, "iResolution");
+	glUniform3f(iResolution, gbm->width, gbm->height, 0);
+	glGenBuffers(1, &vbo);
+	glBindBuffer(GL_ARRAY_BUFFER, vbo);
 	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), 0, GL_STATIC_DRAW);
 	glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof(vertices), &vertices[0]);
 	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 0, (const GLvoid *) (intptr_t) 0);
+	glEnableVertexAttribArray(0);
 
-	gl.egl.draw = draw_shadertoy;
+	egl->draw = draw_shadertoy;
 
-	return &gl.egl;
+	return 0;
 }

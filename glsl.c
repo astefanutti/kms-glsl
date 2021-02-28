@@ -58,7 +58,7 @@ static void usage(const char *name) {
 		   "    -c, --count              run for the specified number of frames\n"
 		   "    -D, --device=DEVICE      use the given device\n"
 		   "    -f, --format=FOURCC      framebuffer format\n"
-		   "    -h, --help      		 print usage\n"
+		   "    -h, --help               print usage\n"
 		   "    -m, --modifier=MODIFIER  hardcode the selected modifier\n"
 		   "    -p, --perfcntr=LIST      sample specified performance counters using\n"
 		   "                             the AMD_performance_monitor extension (comma\n"
@@ -83,6 +83,7 @@ int main(int argc, char *argv[]) {
 	unsigned int vrefresh = 0;
 	unsigned int count = ~0;
 	bool surfaceless = false;
+	int ret;
 
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
 		switch (opt) {
@@ -158,16 +159,20 @@ int main(int argc, char *argv[]) {
 	}
 
 	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay,
-				   format, modifier, surfaceless);
+				format, modifier, surfaceless);
 	if (!gbm) {
 		printf("failed to initialize GBM\n");
 		return -1;
 	}
 
-	egl = init_shadertoy(gbm, shadertoy);
-
+	egl = init_egl(gbm);
 	if (!egl) {
 		printf("failed to initialize EGL\n");
+		return -1;
+	}
+
+	ret = init_shadertoy(gbm, egl, shadertoy);
+	if (ret < 0) {
 		return -1;
 	}
 
