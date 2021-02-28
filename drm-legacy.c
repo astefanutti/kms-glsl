@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2017 Rob Clark <rclark@redhat.com>
+ * Copyright (c) 2020 Antonin Stefanutti <antonin.stefanutti@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -32,7 +33,7 @@
 static struct drm drm;
 
 static void page_flip_handler(int fd, unsigned int frame,
-		  unsigned int sec, unsigned int usec, void *data)
+			unsigned int sec, unsigned int usec, void *data)
 {
 	/* suppress 'unused parameter' warnings */
 	(void)fd, (void)frame, (void)sec, (void)usec;
@@ -51,7 +52,7 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 	struct gbm_bo *bo;
 	struct drm_fb *fb;
 	uint32_t i = 0;
-	int64_t start_time, report_time, cur_time;
+	uint64_t start_time, report_time, cur_time;
 	int ret;
 
 	if (gbm->surface) {
@@ -92,7 +93,7 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 			glBindFramebuffer(GL_FRAMEBUFFER, egl->fbs[frame % NUM_BUFFERS].fb);
 		}
 
-		egl->draw(i++);
+		egl->draw(start_time, i++);
 
 		if (gbm->surface) {
 			eglSwapBuffers(egl->display, egl->surface);

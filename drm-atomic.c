@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2017 Rob Clark <rclark@redhat.com>
+ * Copyright (c) 2020 Antonin Stefanutti <antonin.stefanutti@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -120,7 +121,7 @@ static int drm_atomic_commit(uint32_t fb_id, uint32_t flags)
 				return -1;
 
 		if (drmModeCreatePropertyBlob(drm.fd, drm.mode, sizeof(*drm.mode),
-					      &blob_id) != 0)
+						&blob_id) != 0)
 			return -1;
 
 		if (add_crtc_property(req, drm.crtc_id, "MODE_ID", blob_id) < 0)
@@ -180,14 +181,14 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 	struct drm_fb *fb;
 	uint32_t i = 0;
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
-	int64_t start_time, report_time, cur_time;
+	uint64_t start_time, report_time, cur_time;
 	int ret;
 
 	if (egl_check(egl, eglDupNativeFenceFDANDROID) ||
-	    egl_check(egl, eglCreateSyncKHR) ||
-	    egl_check(egl, eglDestroySyncKHR) ||
-	    egl_check(egl, eglWaitSyncKHR) ||
-	    egl_check(egl, eglClientWaitSyncKHR))
+		egl_check(egl, eglCreateSyncKHR) ||
+		egl_check(egl, eglDestroySyncKHR) ||
+		egl_check(egl, eglWaitSyncKHR) ||
+		egl_check(egl, eglClientWaitSyncKHR))
 		return -1;
 
 	/* Allow a modeset change for the first commit only. */
@@ -227,7 +228,7 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 			glBindFramebuffer(GL_FRAMEBUFFER, egl->fbs[frame % NUM_BUFFERS].fb);
 		}
 
-		egl->draw(i++);
+		egl->draw(start_time, i++);
 
 		/* insert fence to be singled in cmdstream.. this fence will be
 		 * signaled when gpu rendering done

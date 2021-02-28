@@ -146,7 +146,7 @@ struct egl {
 
 	bool modifiers_supported;
 
-	void (*draw)(unsigned i);
+	void (*draw)(uint64_t start_time, unsigned frame);
 };
 
 static inline int __egl_check(void *ptr, const char *name)
@@ -177,6 +177,6 @@ void dump_perfcntrs(unsigned nframes, uint64_t elapsed_time_ns);
 #define USEC_PER_SEC (INT64_C(1000) * MSEC_PER_SEC)
 #define MSEC_PER_SEC INT64_C(1000)
 
-int64_t get_time_ns(void);
+uint64_t get_time_ns(void);
 
 #endif /* _COMMON_H */

@@ -520,7 +520,7 @@ int link_program(unsigned program)
 	return 0;
 }
 
-int64_t get_time_ns(void)
+uint64_t get_time_ns(void)
 {
 	struct timespec tv;
 	clock_gettime(CLOCK_MONOTONIC, &tv);

@@ -38,7 +38,7 @@
 
 #include "common.h"
 
-GLint iTime;
+GLint iTime, iFrame;
 
 static const char *shadertoy_vs =
 		"attribute vec3 position;                \n"
@@ -51,6 +51,7 @@ static const char *shadertoy_fs_tmpl =
 		"precision mediump float;                                                             \n"
 		"uniform vec3      iResolution;           // viewport resolution (in pixels)          \n"
 		"uniform float     iTime;                 // shader playback time (in seconds)        \n"
+		"uniform int       iFrame;                // current frame number                     \n"
 		"uniform vec4      iMouse;                // mouse pixel coords                       \n"
 		"uniform vec4      iDate;                 // (year, month, day, time in seconds)      \n"
 		"uniform float     iSampleRate;           // sound sample rate (i.e., 44100)          \n"
@@ -96,8 +97,11 @@ static char *load_shader(const char *file) {
 	return frag;
 }
 
-static void draw_shadertoy(unsigned i) {
-	glUniform1f(iTime, (float) i / 60.0f);
+static void draw_shadertoy(uint64_t start_time, unsigned frame) {
+	glUniform1f(iTime, (get_time_ns() - start_time) / (double) NSEC_PER_SEC);
+	// Replace the above to input ellapsed time relative to 60 FPS
+	// glUniform1f(iTime, (float) frame / 60.0f);
+	glUniform1ui(iFrame, frame);
 
 	start_perfcntrs();
 
@@ -131,6 +135,7 @@ int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 	glViewport(0, 0, gbm->width, gbm->height);
 	glUseProgram(program);
 	iTime = glGetUniformLocation(program, "iTime");
+	iFrame = glGetUniformLocation(program, "iFrame");
 	iResolution = glGetUniformLocation(program, "iResolution");
 	glUniform3f(iResolution, gbm->width, gbm->height, 0);
 	glGenBuffers(1, &vbo);
