@@ -45,7 +45,7 @@ options:
 
 > :warning: [Image shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
 
-You can try with the shaders copied from Shadertoy into the `examples` directory, e.g.: 
+You can try with the shaders copied from Shadertoy into the `examples` directory, e.g.:
 
 ```shell
 $ ./glsl examples/stripey_torus_interior.glsl
@@ -85,7 +85,7 @@ Assuming you've installed [Raspberry Pi OS](https://www.raspberrypi.org/software
 
 Note this also works with the Raspberry Pi OS Lite versions, as it does not need any compositor like X, Wayland or similar.
 
-It has successfully been tested on the RPi 3B+ and RPi 4, running the Raspberry Pi OS Lite 2020-12-02, Linux kernel 5.4.79. 
+It has successfully been tested on the RPi 3B+ and RPi 4, running the Raspberry Pi OS Lite 2020-12-02, Linux kernel 5.4.79.
 
 ## TODO
 
