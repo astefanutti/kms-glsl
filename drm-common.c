@@ -92,7 +92,7 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 			modifiers[i] = modifiers[0];
 		}
 
-		if (modifiers[0]) {
+		if (modifiers[0] && modifiers[0] != DRM_FORMAT_MOD_INVALID) {
 			flags = DRM_MODE_FB_MODIFIERS;
 			printf("Using modifier %" PRIx64 "\n", modifiers[0]);
 		}
