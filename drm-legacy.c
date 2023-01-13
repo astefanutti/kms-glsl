@@ -170,12 +170,12 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 	return 0;
 }
 
-const struct drm * init_drm_legacy(const char *device, const char *mode_str,
+const struct drm * init_drm_legacy(int fd, const char *mode_str,
 		unsigned int vrefresh, unsigned int count)
 {
 	int ret;
 
-	ret = init_drm(&drm, device, mode_str, vrefresh, count);
+	ret = init_drm(&drm, fd, mode_str, vrefresh, count);
 	if (ret)
 		return NULL;
 

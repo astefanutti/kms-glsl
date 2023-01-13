@@ -76,8 +76,9 @@ struct drm_fb {
 
 struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo);
 
-int init_drm(struct drm *drm, const char *device, const char *mode_str, unsigned int vrefresh, unsigned int count);
-const struct drm * init_drm_legacy(const char *device, const char *mode_str, unsigned int vrefresh, unsigned int count);
-const struct drm * init_drm_atomic(const char *device, const char *mode_str, unsigned int vrefresh, unsigned int count);
+int find_drm_device();
+int init_drm(struct drm *drm, int fd, const char *mode_str, unsigned int vrefresh, unsigned int count);
+const struct drm * init_drm_legacy(int fd, const char *mode_str, unsigned int vrefresh, unsigned int count);
+const struct drm * init_drm_atomic(int fd, const char *mode_str, unsigned int vrefresh, unsigned int count);
 
 #endif /* _DRM_COMMON_H */

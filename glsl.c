@@ -27,6 +27,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <getopt.h>
+#include <fcntl.h>
 
 #include "common.h"
 #include "drm-common.h"
@@ -148,10 +149,21 @@ int main(int argc, char *argv[]) {
 	}
 	shadertoy = argv[optind];
 
-	if (atomic) {
-		drm = init_drm_atomic(device, mode_str, vrefresh, count);
+	int fd;
+	if (device) {
+		fd = open(device, O_RDWR);
 	} else {
-		drm = init_drm_legacy(device, mode_str, vrefresh, count);
+		fd = find_drm_device();
+	}
+	if (fd < 0) {
+		printf("could not open drm device\n");
+		return -1;
+	}
+
+	if (atomic) {
+		drm = init_drm_atomic(fd, mode_str, vrefresh, count);
+	} else {
+		drm = init_drm_legacy(fd, mode_str, vrefresh, count);
 	}
 	if (!drm) {
 		printf("failed to initialize %s DRM\n", atomic ? "atomic" : "legacy");

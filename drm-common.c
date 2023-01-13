@@ -175,7 +175,7 @@ static int get_resources(int fd, drmModeRes **resources)
 
 #define MAX_DRM_DEVICES 64
 
-static int find_drm_device(drmModeRes **resources)
+int find_drm_device()
 {
 	drmDevicePtr devices[MAX_DRM_DEVICES] = { NULL };
 	int num_devices, fd = -1;
@@ -187,6 +187,7 @@ static int find_drm_device(drmModeRes **resources)
 	}
 
 	for (int i = 0; i < num_devices; i++) {
+		drmModeRes *resources;
 		drmDevicePtr device = devices[i];
 		int ret;
 
@@ -199,7 +200,8 @@ static int find_drm_device(drmModeRes **resources)
 		fd = open(device->nodes[DRM_NODE_PRIMARY], O_RDWR);
 		if (fd < 0)
 			continue;
-		ret = get_resources(fd, resources);
+		ret = get_resources(fd, &resources);
+		drmModeFreeResources(resources);
 		if (!ret)
 			break;
 		close(fd);
@@ -212,28 +214,17 @@ static int find_drm_device(drmModeRes **resources)
 	return fd;
 }
 
-int init_drm(struct drm *drm, const char *device, const char *mode_str,
+int init_drm(struct drm *drm, const int fd, const char *mode_str,
 		unsigned int vrefresh, unsigned int count)
 {
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
 	drmModeEncoder *encoder = NULL;
-	int i, ret, area;
+	int i, area;
 
-	if (device) {
-		drm->fd = open(device, O_RDWR);
-		ret = get_resources(drm->fd, &resources);
-		if (ret < 0 && errno == EOPNOTSUPP)
-			printf("%s does not look like a modeset device\n", device);
-	} else {
-		drm->fd = find_drm_device(&resources);
-	}
+	drm->fd = fd;
 
-	if (drm->fd < 0) {
-		printf("could not open drm device\n");
-		return -1;
-	}
-
+	get_resources(drm->fd, &resources);
 	if (!resources) {
 		printf("drmModeGetResources failed: %s\n", strerror(errno));
 		return -1;
