@@ -125,6 +125,9 @@ const struct gbm * init_gbm(int drm_fd, int w, int h, uint32_t format,
 		uint64_t modifier, bool surfaceless)
 {
 	gbm.dev = gbm_create_device(drm_fd);
+	if (!gbm.dev)
+		return NULL;
+
 	gbm.format = format;
 	gbm.surface = NULL;
 
