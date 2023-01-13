@@ -124,7 +124,7 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 	return fb;
 }
 
-static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
+static int32_t find_crtc_for_encoder(const drmModeRes *resources,
 		const drmModeEncoder *encoder) {
 	int i;
 
@@ -143,7 +143,7 @@ static uint32_t find_crtc_for_encoder(const drmModeRes *resources,
 	return -1;
 }
 
-static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
+static int32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
 		const drmModeConnector *connector) {
 	int i;
 
@@ -152,7 +152,7 @@ static uint32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes 
 		drmModeEncoder *encoder = drmModeGetEncoder(drm->fd, encoder_id);
 
 		if (encoder) {
-			const uint32_t crtc_id = find_crtc_for_encoder(resources, encoder);
+			const int32_t crtc_id = find_crtc_for_encoder(resources, encoder);
 
 			drmModeFreeEncoder(encoder);
 			if (crtc_id != 0) {
@@ -300,8 +300,8 @@ int init_drm(struct drm *drm, const int fd, const char *mode_str,
 	if (encoder) {
 		drm->crtc_id = encoder->crtc_id;
 	} else {
-		uint32_t crtc_id = find_crtc_for_connector(drm, resources, connector);
-		if (crtc_id == 0) {
+		int32_t crtc_id = find_crtc_for_connector(drm, resources, connector);
+		if (crtc_id == -1) {
 			printf("no crtc found!\n");
 			return -1;
 		}
