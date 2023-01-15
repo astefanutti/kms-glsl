@@ -32,6 +32,8 @@
 #include "common.h"
 #include "drm-common.h"
 
+#include "lease.h"
+
 static const struct egl *egl;
 static const struct gbm *gbm;
 static const struct drm *drm;
@@ -153,10 +155,34 @@ int main(int argc, char *argv[]) {
 	if (device) {
 		fd = open(device, O_RDWR);
 	} else {
+#if XCB_LEASE
+		xcb_connection_t *connection;
+		int screen;
+
+		connection = xcb_connect(NULL, &screen);
+		int err = xcb_connection_has_error(connection);
+		if (err > 0) {
+			printf("Connection attempt to X server failed with error %d, falling back to DRM\n", err);
+			xcb_disconnect(connection);
+
+			fd = find_drm_device();
+		} else {
+			xcb_randr_query_version_cookie_t rqv_c = xcb_randr_query_version(connection,XCB_RANDR_MAJOR_VERSION,XCB_RANDR_MINOR_VERSION);
+			xcb_randr_query_version_reply_t *rqv_r = xcb_randr_query_version_reply(connection, rqv_c, NULL);
+			if (!rqv_r || rqv_r->minor_version < 6) {
+				printf("No new-enough RandR version: %d\n", rqv_r->minor_version);
+				return -1;
+			}
+			free(rqv_r);
+
+			fd = xcb_lease(connection, &screen);
+		}
+#else
 		fd = find_drm_device();
+#endif
 	}
 	if (fd < 0) {
-		printf("could not open drm device\n");
+		printf("could not open DRM device\n");
 		return -1;
 	}
 
@@ -170,8 +196,7 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay,
-				format, modifier, surfaceless);
+	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay, format, modifier, surfaceless);
 	if (!gbm) {
 		printf("failed to initialize GBM\n");
 		return -1;
