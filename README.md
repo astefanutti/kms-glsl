@@ -3,7 +3,7 @@
 KMS GLSL is a command line tool that runs OpenGL fragment shaders, using the [DRM/KMS Linux kernel subsystem](https://en.wikipedia.org/wiki/Direct_Rendering_Manager).
 It runs shaders fullscreen, and does not require any windowing system, like X or Wayland.
 
-It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](#raspberry-pi), using the VC4/V3D KMS driver, that exposes OpenGL ES 3.1 (as of December 2020).
+It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](#raspberry-pi), using the VC4/V3D KMS driver, that supports OpenGL ES 3.1 (as of January 2023).
 However, it should work with any GPU and display controller hardware, provided a DRM/KMS driver is available.
 
 In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the official Raspberry Pi 7″ touchscreen monitor, connected to a Raspberry Pi 4<sup name="a1">[1](#f1)</sup>:
@@ -69,14 +69,10 @@ Assuming you've installed [Raspberry Pi OS](https://www.raspberrypi.org/software
 2. Set the following properties:
 
     ```properties
-    # Required: Enable the firmware/fake DRM/KMS VC4/V3D driver
-    dtoverlay=vc4-fkms-v3d
+    # Required: Enable the DRM/KMS VC4 V3D driver
+    dtoverlay=vc4-kms-v3d
     # Optional: Increase the memory reserved for the GPU
-    #           16MB disables certain GPU features
-    gpu_mem=64
-    # Optional: Avoid GPU down-clocking below 500 MHz that slows FPS down
-    #           Should be set to 250 on the RPi 3
-    v3d_freq_min=500
+    gpu_mem=128
     ```
 
 3. Reboot your Raspberry Pi, so that the changes are taken into account, e.g.:
@@ -87,7 +83,7 @@ Assuming you've installed [Raspberry Pi OS](https://www.raspberrypi.org/software
 
 Note this also works with the Raspberry Pi OS Lite versions, as it does not need any compositor like X, Wayland or similar.
 
-It has successfully been tested on the RPi 3B+ and RPi 4, running the Raspberry Pi OS Lite 2020-12-02, Linux kernel 5.4.79.
+It has successfully been tested on the RPi 4, running the Raspberry Pi OS 2023-09-22, Linux kernel 5.15.
 
 ## TODO
 
