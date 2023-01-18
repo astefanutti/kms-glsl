@@ -1,7 +1,7 @@
 # KMS GLSL
 
 KMS GLSL is a command line tool that runs OpenGL fragment shaders, using the [DRM/KMS Linux kernel subsystem](https://en.wikipedia.org/wiki/Direct_Rendering_Manager).
-It runs shaders fullscreen, and does not need any windowing system, like X or Wayland.
+It runs shaders fullscreen, and does not require any windowing system, like X or Wayland.
 
 It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](#raspberry-pi), using the VC4/V3D KMS driver, that exposes OpenGL ES 3.1 (as of December 2020).
 However, it should work with any GPU and display controller hardware, provided a DRM/KMS driver is available.
@@ -18,6 +18,8 @@ $ sudo apt update
 $ sudo apt install gcc make
 # Install the required DRM, GBM, EGL and OpenGL ES API headers
 $ sudo apt install libdrm-dev libgbm-dev libegl-dev libgles2-mesa-dev
+# Install the X C binding and RandR extension header / library files (optional)
+$ sudo apt install libxcb-randr0-dev
 # Build the glsl CLI binary
 $ make
 ```
