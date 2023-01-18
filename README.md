@@ -45,8 +45,6 @@ options:
     -x, --surfaceless        use surfaceless mode, instead of GBM surface
 ```
 
-> :warning: [Image shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
-
 You can try with the shaders copied from Shadertoy into the `examples` directory, e.g.:
 
 ```shell
@@ -55,6 +53,10 @@ $ ./glsl examples/stripey_torus_interior.glsl
 
 Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
 You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
+
+> :warning: [Image shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
+>
+> Note the shaders from the `examples` directory assume OpenGL ES 3.1 support, and may not work with lower versions of the specification.
 
 ## Raspberry Pi
 
