@@ -85,7 +85,7 @@ vec3 stripe(jet2 f, float r_px) {
     // tangent space to find out how much of the pixel falls on the other side
     // of the nearest edge
     float overflow = 0.5*erfc_appx(screen_dist / r_px);
-    return mix(colors[n], colors[(n+1)%N], pattern_disp < 0. ? overflow : 1.-overflow);
+    return mix(colors[n], colors[int(mod(float(n+1),float(N)))], pattern_disp < 0. ? overflow : 1.-overflow);
 }
 
 // --- test image ---
