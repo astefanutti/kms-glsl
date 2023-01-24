@@ -23,16 +23,15 @@
 
 #define _GNU_SOURCE
 
-#include <assert.h>
 #include <err.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <unistd.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <sys/types.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <regex.h>
+#include <stdlib.h>
 
 #include <GLES3/gl3.h>
 
@@ -40,15 +39,34 @@
 
 GLint iTime, iFrame;
 
-static const char *shadertoy_vs =
+static const char *shadertoy_vs_tmpl_100 =
+		"// version (default: 1.10)              \n"
+		"%s                                      \n"
+		"                                        \n"
 		"attribute vec3 position;                \n"
+		"                                        \n"
 		"void main()                             \n"
 		"{                                       \n"
 		"    gl_Position = vec4(position, 1.0);  \n"
 		"}                                       \n";
 
-static const char *shadertoy_fs_tmpl =
+static const char *shadertoy_vs_tmpl_300 =
+		"// version                              \n"
+		"%s                                      \n"
+		"                                        \n"
+		"in vec3 position;                       \n"
+		"                                        \n"
+		"void main()                             \n"
+		"{                                       \n"
+		"    gl_Position = vec4(position, 1.0);  \n"
+		"}                                       \n";
+
+static const char *shadertoy_fs_tmpl_100 =
+		"// version (default: 1.10)                                                           \n"
+		"%s                                                                                   \n"
+		"                                                                                     \n"
 		"precision mediump float;                                                             \n"
+		"                                                                                     \n"
 		"uniform vec3      iResolution;           // viewport resolution (in pixels)          \n"
 		"uniform float     iTime;                 // shader playback time (in seconds)        \n"
 		"uniform int       iFrame;                // current frame number                     \n"
@@ -58,11 +76,37 @@ static const char *shadertoy_fs_tmpl =
 		"uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)           \n"
 		"uniform float     iChannelTime[4];       // channel playback time (in sec)           \n"
 		"                                                                                     \n"
+		"// Shader body                                                                       \n"
 		"%s                                                                                   \n"
 		"                                                                                     \n"
 		"void main()                                                                          \n"
 		"{                                                                                    \n"
 		"    mainImage(gl_FragColor, gl_FragCoord.xy);                                        \n"
+		"}                                                                                    \n";
+
+static const char *shadertoy_fs_tmpl_300 =
+		"// version                                                                           \n"
+		"%s                                                                                   \n"
+		"                                                                                     \n"
+		"precision mediump float;                                                             \n"
+		"                                                                                     \n"
+		"out vec4 fragColor;                                                                  \n"
+		"                                                                                     \n"
+		"uniform vec3      iResolution;           // viewport resolution (in pixels)          \n"
+		"uniform float     iTime;                 // shader playback time (in seconds)        \n"
+		"uniform int       iFrame;                // current frame number                     \n"
+		"uniform vec4      iMouse;                // mouse pixel coords                       \n"
+		"uniform vec4      iDate;                 // (year, month, day, time in seconds)      \n"
+		"uniform float     iSampleRate;           // sound sample rate (i.e., 44100)          \n"
+		"uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)           \n"
+		"uniform float     iChannelTime[4];       // channel playback time (in sec)           \n"
+		"                                                                                     \n"
+		"// Shader body                                                                       \n"
+		"%s                                                                                   \n"
+		"                                                                                     \n"
+		"void main()                                                                          \n"
+		"{                                                                                    \n"
+		"    mainImage(fragColor, gl_FragCoord.xy);                                           \n"
 		"}                                                                                    \n";
 
 static const GLfloat vertices[] = {
@@ -76,9 +120,8 @@ static const GLfloat vertices[] = {
 		1.0f, 1.0f,
 };
 
-static char *load_shader(const char *file) {
+static const char *load_shader(const char *file) {
 	struct stat statbuf;
-	char *frag;
 	int fd, ret;
 
 	fd = open(file, 0);
@@ -91,15 +134,60 @@ static char *load_shader(const char *file) {
 		err(ret, "could not stat '%s'", file);
 	}
 
-	const char *text = mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	asprintf(&frag, shadertoy_fs_tmpl, text);
+	return mmap(NULL, statbuf.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+}
 
-	return frag;
+#define GLSL_VERSION_REGEX "GLSL[[:space:]]*(ES)?[[:space:]]*([[:digit:]]+)\\.([[:digit:]]+)"
+
+static char *extract_group(const char *str, regmatch_t group) {
+	char *c = calloc(group.rm_eo - group.rm_so, sizeof(char));
+	memcpy(c, &str[group.rm_so], group.rm_eo - group.rm_so);
+	return c;
+}
+
+static char *glsl_version() {
+	int ret;
+	regex_t regex;
+	if ((ret = regcomp(&regex, GLSL_VERSION_REGEX, REG_EXTENDED)) != 0) {
+		err(ret, "failed to compile GLSL version regex");
+	}
+
+	char *version = "";
+	const char *glsl_version = (char *) glGetString(GL_SHADING_LANGUAGE_VERSION);
+	if (strlen(glsl_version) == 0) {
+		printf("Cannot detect GLSL version from %s\n", "GL_SHADING_LANGUAGE_VERSION");
+		return version;
+	}
+
+	size_t nGroups = 4;
+	regmatch_t groups[nGroups];
+	ret = regexec(&regex, glsl_version, nGroups, groups, 0);
+	if (ret == REG_NOMATCH) {
+		printf("Cannot match GLSL version '%s'\n", glsl_version);
+	} else if (ret != 0) {
+		err(ret, "failed to match GLSL version '%s'", glsl_version);
+	} else {
+		char *es = extract_group(glsl_version, groups[1]);
+		char *major = extract_group(glsl_version, groups[2]);
+		char *minor = extract_group(glsl_version, groups[3]);
+
+		bool is100 = strcmp(major, "1") == 0 && strcmp(minor, "00") == 0;
+		bool hasES = strcasecmp(es, "ES") == 0 && !is100;
+
+		asprintf(&version, "%s%s%s", major, minor, hasES ? " es" : "");
+
+		free(es);
+		free(major);
+		free(minor);
+	}
+	regfree(&regex);
+
+	return version;
 }
 
 static void draw_shadertoy(uint64_t start_time, unsigned frame) {
 	glUniform1f(iTime, (get_time_ns() - start_time) / (double) NSEC_PER_SEC);
-	// Replace the above to input ellapsed time relative to 60 FPS
+	// Replace the above to input elapsed time relative to 60 FPS
 	// glUniform1f(iTime, (float) frame / 60.0f);
 	glUniform1ui(iFrame, frame);
 
@@ -112,11 +200,31 @@ static void draw_shadertoy(uint64_t start_time, unsigned frame) {
 
 int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 	int ret;
-	char *shadertoy_fs;
+	char *shadertoy_vs, *shadertoy_fs;
 	GLuint program, vbo;
 	GLint iResolution;
 
-	shadertoy_fs = load_shader(file);
+	const char *shader = load_shader(file);
+
+	const char *version = glsl_version();
+	if (strlen(version) > 0) {
+		char *invalid;
+		long v = strtol(version, &invalid, 10);
+		if (invalid == version) {
+			printf("failed to parse detected GLSL version: %s\n", invalid);
+			return -1;
+		}
+		char *version_directive;
+		asprintf(&version_directive, "#version %s", version);
+		printf("Use GLSL version directive: %s\n", version_directive);
+
+		bool is_glsl_3 = v >= 300;
+		asprintf(&shadertoy_vs, is_glsl_3 ? shadertoy_vs_tmpl_300 : shadertoy_vs_tmpl_100, version_directive);
+		asprintf(&shadertoy_fs, is_glsl_3 ? shadertoy_fs_tmpl_300 : shadertoy_fs_tmpl_100, version_directive, shader);
+	} else {
+		asprintf(&shadertoy_vs, shadertoy_vs_tmpl_100, version);
+		asprintf(&shadertoy_fs, shadertoy_fs_tmpl_100, version, shader);
+	}
 
 	ret = create_program(shadertoy_vs, shadertoy_fs);
 	if (ret < 0) {
