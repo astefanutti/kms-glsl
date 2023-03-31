@@ -158,6 +158,7 @@ static char *glsl_version() {
 		printf("Cannot detect GLSL version from %s\n", "GL_SHADING_LANGUAGE_VERSION");
 		return version;
 	}
+	printf("Detected GLSL version: %s\n", glsl_version);
 
 	size_t nGroups = 4;
 	regmatch_t groups[nGroups];
@@ -170,6 +171,12 @@ static char *glsl_version() {
 		char *es = extract_group(glsl_version, groups[1]);
 		char *major = extract_group(glsl_version, groups[2]);
 		char *minor = extract_group(glsl_version, groups[3]);
+
+		if (strcmp(minor, "0") == 0) {
+			free(minor);
+			minor = malloc(2);
+			strcpy(minor, "00");
+		}
 
 		bool is100 = strcmp(major, "1") == 0 && strcmp(minor, "00") == 0;
 		bool hasES = strcasecmp(es, "ES") == 0 && !is100;
