@@ -193,9 +193,9 @@ static char *glsl_version() {
 }
 
 static void draw_shadertoy(uint64_t start_time, unsigned frame) {
-	glUniform1f(iTime, (get_time_ns() - start_time) / (double) NSEC_PER_SEC);
+	glUniform1f(iTime, (GLfloat) (get_time_ns() - start_time) / NSEC_PER_SEC);
 	// Replace the above to input elapsed time relative to 60 FPS
-	// glUniform1f(iTime, (float) frame / 60.0f);
+	// glUniform1f(iTime, (GLfloat) frame / 60.0f);
 	glUniform1ui(iFrame, frame);
 
 	start_perfcntrs();
