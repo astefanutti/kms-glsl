@@ -174,7 +174,7 @@ static char *glsl_version() {
 
 		if (strcmp(minor, "0") == 0) {
 			free(minor);
-			minor = malloc(2);
+			minor = malloc(sizeof(char) * 3);
 			strcpy(minor, "00");
 		}
 
