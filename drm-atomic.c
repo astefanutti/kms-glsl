@@ -189,6 +189,13 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 
 		egl->draw(start_time, i++);
 
+		/* Block until all the buffered GL operations are completed.
+		 * This is required on NVIDIA GPUs, for which the DRM drivers
+		 * do not wait for the rendering to complete, upon executing
+		 * page flipping operations.
+		 */
+		glFinish();
+
 		if (gbm->surface) {
 			eglSwapBuffers(egl->display, egl->surface);
 		}

@@ -95,11 +95,17 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 
 		egl->draw(start_time, i++);
 
+		/* Block until all the buffered GL operations are completed.
+		 * This is required on NVIDIA GPUs, for which the DRM drivers
+		 * do not wait for the rendering to complete, upon executing
+		 * page flipping operations, such as drmModePageFlip().
+		 */
+		glFinish();
+
 		if (gbm->surface) {
 			eglSwapBuffers(egl->display, egl->surface);
 			next_bo = gbm_surface_lock_front_buffer(gbm->surface);
 		} else {
-			glFinish();
 			next_bo = gbm->bos[frame % NUM_BUFFERS];
 		}
 		fb = drm_fb_get_from_bo(next_bo);
