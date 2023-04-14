@@ -166,7 +166,6 @@ static char *glsl_version() {
 		printf("Cannot detect GLSL version from %s\n", "GL_SHADING_LANGUAGE_VERSION");
 		return version;
 	}
-	printf("Detected GLSL version: %s\n", glsl_version);
 
 	size_t nGroups = 4;
 	regmatch_t groups[nGroups];
@@ -231,7 +230,7 @@ int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 		}
 		char *version_directive;
 		asprintf(&version_directive, "#version %s", version);
-		printf("Use GLSL version directive: %s\n", version_directive);
+		printf("Using GLSL version directive: %s\n", version_directive);
 
 		bool is_glsl_3 = v >= 300;
 		asprintf(&shadertoy_vs, is_glsl_3 ? shadertoy_vs_tmpl_300 : shadertoy_vs_tmpl_100, version_directive);
