@@ -150,17 +150,23 @@ static void on_pageflip_event(
 		unsigned int usec,
 		void *userdata
 ) {
-//	printf("page flip event ocurred: %12.6f\n", sec + (usec / 1000000.0));
+//	printf("page flip event occurred: %12.6f\n", sec + (usec / 1000000.0));
 }
 
-static int atomic_run(const struct gbm *gbm, const struct egl *egl)
+static int atomic_run(const struct gbm *gbm, const struct egl *egl, const struct options *options)
 {
 	struct gbm_bo *bo = NULL;
 	struct drm_fb *fb;
 	uint32_t i = 0;
-	uint32_t flags = DRM_MODE_PAGE_FLIP_EVENT | DRM_MODE_ATOMIC_NONBLOCK;
 	uint64_t start_time, report_time, cur_time;
 	int ret;
+
+	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
+	if (options->async_page_flip) {
+		flags |= DRM_MODE_PAGE_FLIP_ASYNC;
+	} else {
+		flags |= DRM_MODE_PAGE_FLIP_EVENT;
+	}
 
 	drmEventContext evctx = {
 			.version = 4,
@@ -246,10 +252,12 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 			return -1;
 		}
 
-		ret = drmHandleEvent(drm.fd, &evctx);
-		if (ret) {
-			printf("failed to wait for page flip completion\n");
-			return -1;
+		if (!options->async_page_flip) {
+			ret = drmHandleEvent(drm.fd, &evctx);
+			if (ret) {
+				printf("failed to wait for page flip completion\n");
+				return -1;
+			}
 		}
 
 		/* release last buffer to render on again: */
@@ -334,12 +342,12 @@ static int get_plane_id(void)
 }
 
 const struct drm * init_drm_atomic(int fd, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+		const struct options *options)
 {
 	uint32_t plane_id;
 	int ret;
 
-	ret = init_drm(&drm, fd, mode_str, vrefresh, count);
+	ret = init_drm(&drm, fd, mode_str, options);
 	if (ret)
 		return NULL;
 

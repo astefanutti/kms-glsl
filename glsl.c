@@ -38,9 +38,10 @@ static const struct egl *egl;
 static const struct gbm *gbm;
 static const struct drm *drm;
 
-static const char *shortopts = "Ac:D:f:hm:p:v:x";
+static const char *shortopts = "aAc:D:f:hm:p:v:x";
 
 static const struct option longopts[] = {
+		{"async",       no_argument,       0, 'a'},
 		{"atomic",      no_argument,       0, 'A'},
 		{"count",       required_argument, 0, 'c'},
 		{"device",      required_argument, 0, 'D'},
@@ -54,9 +55,10 @@ static const struct option longopts[] = {
 };
 
 static void usage(const char *name) {
-	printf("Usage: %s [-AcDfmpvx] <shader_file>\n"
+	printf("Usage: %s [-aAcDfmpvx] <shader_file>\n"
 		   "\n"
 		   "options:\n"
+		   "    -a, --async              use async page flipping\n"
 		   "    -A, --atomic             use atomic modesetting and fencing\n"
 		   "    -c, --count              run for the specified number of frames\n"
 		   "    -D, --device=DEVICE      use the given device\n"
@@ -77,24 +79,26 @@ int main(int argc, char *argv[]) {
 	const char *shadertoy = NULL;
 	const char *perfcntr = NULL;
 	char mode_str[DRM_DISPLAY_MODE_LEN] = "";
-	char *p;
 	uint32_t format = DRM_FORMAT_XRGB8888;
 	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
-	int atomic = 0;
-	int opt;
-	unsigned int len;
-	unsigned int vrefresh = 0;
-	unsigned int count = ~0;
-	bool surfaceless = false;
+
+	struct options options;
+
 	int ret;
 
+	char *p;
+	int opt;
+	unsigned int len;
 	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
 		switch (opt) {
+			case 'a':
+				options.async_page_flip = true;
+				break;
 			case 'A':
-				atomic = 1;
+				options.drm_mode_atomic = true;
 				break;
 			case 'c':
-				count = strtoul(optarg, NULL, 0);
+				options.count = strtoul(optarg, NULL, 0);
 				break;
 			case 'D':
 				device = optarg;
@@ -128,7 +132,7 @@ int main(int argc, char *argv[]) {
 				if (p == NULL) {
 					len = strlen(optarg);
 				} else {
-					vrefresh = strtoul(p + 1, NULL, 0);
+					options.vrefresh = strtoul(p + 1, NULL, 0);
 					len = p - optarg;
 				}
 				if (len > sizeof(mode_str) - 1)
@@ -137,7 +141,7 @@ int main(int argc, char *argv[]) {
 				mode_str[len] = '\0';
 				break;
 			case 'x':
-				surfaceless = true;
+				options.surfaceless = true;
 				break;
 			default:
 				usage(argv[0]);
@@ -186,17 +190,17 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-	if (atomic) {
-		drm = init_drm_atomic(fd, mode_str, vrefresh, count);
+	if (options.drm_mode_atomic) {
+		drm = init_drm_atomic(fd, mode_str, &options);
 	} else {
-		drm = init_drm_legacy(fd, mode_str, vrefresh, count);
+		drm = init_drm_legacy(fd, mode_str, &options);
 	}
 	if (!drm) {
-		printf("failed to initialize %s DRM\n", atomic ? "atomic" : "legacy");
+		printf("failed to initialize %s DRM\n", options.drm_mode_atomic ? "atomic" : "legacy");
 		return -1;
 	}
 
-	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay, format, modifier, surfaceless);
+	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay, format, modifier, options.surfaceless);
 	if (!gbm) {
 		printf("failed to initialize GBM\n");
 		return -1;
@@ -220,5 +224,5 @@ int main(int argc, char *argv[]) {
 	glClearColor(0.5, 0.5, 0.5, 1.0);
 	glClear(GL_COLOR_BUFFER_BIT);
 
-	return drm->run(gbm, egl);
+	return drm->run(gbm, egl, &options);
 }
