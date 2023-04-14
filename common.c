@@ -370,8 +370,6 @@ const struct egl * init_egl(const struct gbm *gbm)
 	printf("EGL information:\n");
 	printf("  version: \"%s\"\n", eglQueryString(egl.display, EGL_VERSION));
 	printf("  vendor: \"%s\"\n", eglQueryString(egl.display, EGL_VENDOR));
-	printf("  client extensions: \"%s\"\n", egl_exts_client);
-	printf("  display extensions: \"%s\"\n", egl_exts_dpy);
 	printf("===================================\n");
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
@@ -412,7 +410,6 @@ const struct egl * init_egl(const struct gbm *gbm)
 	printf("  shading language version: \"%s\"\n", glGetString(GL_SHADING_LANGUAGE_VERSION));
 	printf("  vendor: \"%s\"\n", glGetString(GL_VENDOR));
 	printf("  renderer: \"%s\"\n", glGetString(GL_RENDERER));
-	printf("  extensions: \"%s\"\n", gl_exts);
 	printf("===================================\n");
 
 	get_proc_gl(GL_OES_EGL_image, glEGLImageTargetTexture2DOES);
