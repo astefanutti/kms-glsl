@@ -42,7 +42,7 @@ static void page_flip_handler(int fd, unsigned int frame,
 	*waiting_for_flip = 0;
 }
 
-static int legacy_run(const struct gbm *gbm, const struct egl *egl)
+static int legacy_run(const struct gbm *gbm, const struct egl *egl, const struct options *options)
 {
 	fd_set fds;
 	drmEventContext evctx = {
@@ -73,6 +73,14 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 	if (ret) {
 		printf("failed to set mode: %s\n", strerror(errno));
 		return ret;
+	}
+
+	uint32_t flags;
+
+	if (options->async_page_flip) {
+		flags = DRM_MODE_PAGE_FLIP_ASYNC;
+	} else {
+		flags = DRM_MODE_PAGE_FLIP_EVENT;
 	}
 
 	start_time = report_time = get_time_ns();
@@ -120,29 +128,31 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 		 */
 
 		ret = drmModePageFlip(drm.fd, drm.crtc_id, fb->fb_id,
-				DRM_MODE_PAGE_FLIP_EVENT, &waiting_for_flip);
+				flags, &waiting_for_flip);
 		if (ret) {
 			printf("failed to queue page flip: %s\n", strerror(errno));
 			return -1;
 		}
 
-		while (waiting_for_flip) {
-			FD_ZERO(&fds);
-			FD_SET(0, &fds);
-			FD_SET(drm.fd, &fds);
+		if (!options->async_page_flip) {
+			while (waiting_for_flip) {
+				FD_ZERO(&fds);
+				FD_SET(0, &fds);
+				FD_SET(drm.fd, &fds);
 
-			ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
-			if (ret < 0) {
-				printf("select err: %s\n", strerror(errno));
-				return ret;
-			} else if (ret == 0) {
-				printf("select timeout!\n");
-				return -1;
-			} else if (FD_ISSET(0, &fds)) {
-				printf("user interrupted!\n");
-				return 0;
+				ret = select(drm.fd + 1, &fds, NULL, NULL, NULL);
+				if (ret < 0) {
+					printf("select err: %s\n", strerror(errno));
+					return ret;
+				} else if (ret == 0) {
+					printf("select timeout!\n");
+					return -1;
+				} else if (FD_ISSET(0, &fds)) {
+					printf("user interrupted!\n");
+					return 0;
+				}
+				drmHandleEvent(drm.fd, &evctx);
 			}
-			drmHandleEvent(drm.fd, &evctx);
 		}
 
 		cur_time = get_time_ns();
@@ -177,11 +187,11 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 }
 
 const struct drm * init_drm_legacy(int fd, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+		const struct options *options)
 {
 	int ret;
 
-	ret = init_drm(&drm, fd, mode_str, vrefresh, count);
+	ret = init_drm(&drm, fd, mode_str, options);
 	if (ret)
 		return NULL;
 

@@ -215,7 +215,7 @@ int find_drm_device()
 }
 
 int init_drm(struct drm *drm, const int fd, const char *mode_str,
-		unsigned int vrefresh, unsigned int count)
+		 const struct options *options)
 {
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
@@ -255,7 +255,7 @@ int init_drm(struct drm *drm, const int fd, const char *mode_str,
 			drmModeModeInfo *current_mode = &connector->modes[i];
 
 			if (strcmp(current_mode->name, mode_str) == 0) {
-				if (vrefresh == 0 || current_mode->vrefresh == vrefresh) {
+				if (options->vrefresh == 0 || current_mode->vrefresh == options->vrefresh) {
 					drm->mode = current_mode;
 					break;
 				}
@@ -319,7 +319,7 @@ int init_drm(struct drm *drm, const int fd, const char *mode_str,
 	drmModeFreeResources(resources);
 
 	drm->connector_id = connector->connector_id;
-	drm->count = count;
+	drm->count = options->count;
 
 	return 0;
 }

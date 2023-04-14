@@ -64,7 +64,7 @@ struct drm {
 	/* number of frames to run for: */
 	unsigned int count;
 
-	int (*run)(const struct gbm *gbm, const struct egl *egl);
+	int (*run)(const struct gbm *gbm, const struct egl *egl, const struct options *options);
 };
 
 struct drm_fb {
@@ -75,8 +75,8 @@ struct drm_fb {
 struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo);
 
 int find_drm_device();
-int init_drm(struct drm *drm, int fd, const char *mode_str, unsigned int vrefresh, unsigned int count);
-const struct drm * init_drm_legacy(int fd, const char *mode_str, unsigned int vrefresh, unsigned int count);
-const struct drm * init_drm_atomic(int fd, const char *mode_str, unsigned int vrefresh, unsigned int count);
+int init_drm(struct drm *drm, int fd, const char *mode_str, const struct options *options);
+const struct drm * init_drm_legacy(int fd, const char *mode_str, const struct options *options);
+const struct drm * init_drm_atomic(int fd, const char *mode_str, const struct options *options);
 
 #endif /* _DRM_COMMON_H */
