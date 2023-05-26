@@ -85,7 +85,7 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl, const struct
 
 	start_time = report_time = get_time_ns();
 
-	while (i < drm.count) {
+	while (drm.count == 0 || i < drm.count) {
 		unsigned frame = i;
 		struct gbm_bo *next_bo;
 		int waiting_for_flip = 1;
