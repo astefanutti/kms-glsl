@@ -82,7 +82,9 @@ int main(int argc, char *argv[]) {
 	uint32_t format = DRM_FORMAT_XRGB8888;
 	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
 
-	struct options options;
+	struct options options = {
+		.count = 0,
+	};
 
 	int ret;
 
