@@ -28,14 +28,15 @@ $ make
 
 ```console
 $ ./glsl -h
-Usage: ./glsl [-AcDfmpvx] <shader_file>
+Usage: ./glsl [-aAcDfmpvx] <shader_file>
 
 options:
+    -a, --async              use async page flipping
     -A, --atomic             use atomic modesetting and fencing
     -c, --count              run for the specified number of frames
     -D, --device=DEVICE      use the given device
     -f, --format=FOURCC      framebuffer format
-    -h, --help      		 print usage
+    -h, --help               print usage
     -m, --modifier=MODIFIER  hardcode the selected modifier
     -p, --perfcntr=LIST      sample specified performance counters using
                              the AMD_performance_monitor extension (comma
