@@ -3,12 +3,17 @@
 KMS GLSL is a command line tool that runs OpenGL fragment shaders, using the [DRM/KMS Linux kernel subsystem](https://en.wikipedia.org/wiki/Direct_Rendering_Manager).
 It runs shaders fullscreen, and does not require any windowing system, like X or Wayland.
 
-It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](#raspberry-pi), using the VC4/V3D KMS driver, that supports OpenGL ES 3.1 (as of January 2023).
+It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi), using the VC4/V3D KMS driver, that supports OpenGL ES 3.1 (as of January 2023).
 However, it should work with any GPU and display controller hardware, provided a DRM/KMS driver is available.
+It has been successfully tested with the [Jetson Nano](https://ttt.io/glsl-jetson-nano), as well as the Raspberry Pi Zero.
 
-In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the official Raspberry Pi 7″ touchscreen monitor, connected to a Raspberry Pi 4<sup name="a1">[1](#f1)</sup>:
+In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA (800×480) resolution:
 
-![A Shadertoy shader running on a Raspberry Pi 4](./torus.jpg)
+![A Shadertoy shader running on the Raspberry Pi 4](./raspberry_pi.jpg)
+
+[Another shader](https://www.shadertoy.com/view/fstyD4) that runs on the Jetson Nano in full HD (1920×1080) resolution:
+
+![A Shadertoy shader running on the Jetson Nano](./jetson_nano.jpg)
 
 ## Build
 
@@ -102,7 +107,3 @@ It has successfully been tested on the RPi 4, running the Raspberry Pi OS 2023-0
 The DRM/KMS ceremony code is copied from [kmscube](https://gitlab.freedesktop.org/mesa/kmscube/).
 
 The shader examples are copied from the [Shadertoy](https://www.shadertoy.com) website URLs commented at the top of each file.
-
----
-
-<a name="f1">1</a>. The setup is described in the [Anatomy of my Kubernetes cluster](https://ttt.io/anatomy-of-my-kubernetes-cluster). [↩](#a1)
