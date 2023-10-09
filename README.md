@@ -93,14 +93,13 @@ Note this also works with the Raspberry Pi OS Lite versions, as it does not need
 
 It has successfully been tested on the RPi 4, running the Raspberry Pi OS 2023-09-22, Linux kernel 5.15.
 
-## TODO
+## Roadmap
 
-- Feed the mouse uniform with touchscreen events from [tslib](http://www.tslib.org)
-- Forward keyboard events to the input keyboard texture
+- Feed the mouse uniform and keyboard texture
+- Feed arbitrary variables / buffers from different languages / runtimes (Python, Node.js, ...)
 - Feed audio / video inputs to microphone / camera textures
-- Package Shadertoy default media files
-- Load arbitrary input texture files
-- Ability to load multiple shaders into a carousel-like experience
+- Package Shadertoy default textures (image, font, noise, ...)
+- Load arbitrary texture files
 
 ## Credits
 
