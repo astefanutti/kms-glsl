@@ -99,8 +99,12 @@ EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformPixmapSurfaceEXT (EGLDisplay dpy,
 #define NUM_BUFFERS 2
 
 struct options {
+	const char *device;
+	char mode[DRM_DISPLAY_MODE_LEN];
+	uint32_t format;
+	uint64_t modifier;
 	bool async_page_flip;
-	bool drm_mode_atomic;
+	bool atomic_drm_mode;
 	bool surfaceless;
 	unsigned int vrefresh;
 	unsigned int count;

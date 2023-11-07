@@ -153,7 +153,7 @@ static void on_pageflip_event(
 //	printf("page flip event occurred: %12.6f\n", sec + (usec / 1000000.0));
 }
 
-static int atomic_run(const struct gbm *gbm, const struct egl *egl, const struct options *options)
+static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 {
 	struct gbm_bo *bo = NULL;
 	struct drm_fb *fb;
@@ -162,7 +162,7 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl, const struct
 	int ret;
 
 	uint32_t flags = DRM_MODE_ATOMIC_NONBLOCK;
-	if (options->async_page_flip) {
+	if (drm.async_page_flip) {
 		flags |= DRM_MODE_PAGE_FLIP_ASYNC;
 	} else {
 		flags |= DRM_MODE_PAGE_FLIP_EVENT;
@@ -252,7 +252,7 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl, const struct
 			return -1;
 		}
 
-		if (!options->async_page_flip) {
+		if (!drm.async_page_flip) {
 			ret = drmHandleEvent(drm.fd, &evctx);
 			if (ret) {
 				printf("failed to wait for page flip completion\n");
@@ -283,11 +283,11 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl, const struct
 	return ret;
 }
 
-/* Pick a plane.. something that at a minimum can be connected to
+/* Pick a plane, something that at a minimum can be connected to
  * the chosen crtc, but prefer primary plane.
  *
  * Seems like there is some room for a drmModeObjectGetNamedProperty()
- * type helper in libdrm..
+ * type helper in libdrm.
  */
 static int get_plane_id(void)
 {
@@ -341,13 +341,12 @@ static int get_plane_id(void)
 	return ret;
 }
 
-const struct drm * init_drm_atomic(int fd, const char *mode_str,
-		const struct options *options)
+const struct drm * init_drm_atomic(int fd, const struct options *options)
 {
-	uint32_t plane_id;
 	int ret;
+	uint32_t plane_id;
 
-	ret = init_drm(&drm, fd, mode_str, options);
+	ret = init_drm(&drm, fd, options);
 	if (ret)
 		return NULL;
 
@@ -408,6 +407,7 @@ const struct drm * init_drm_atomic(int fd, const char *mode_str,
 	get_properties(connector, CONNECTOR, drm.connector_id);
 
 	drm.run = atomic_run;
+	drm.async_page_flip = options->async_page_flip;
 
 	return &drm;
 }
