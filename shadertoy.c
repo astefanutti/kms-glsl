@@ -76,9 +76,6 @@ static const char *shadertoy_fs_tmpl_100 =
 		"uniform int       iFrame;                // current frame number                     \n"
 		"uniform vec4      iMouse;                // mouse pixel coords                       \n"
 		"uniform vec4      iDate;                 // (year, month, day, time in seconds)      \n"
-		"uniform float     iSampleRate;           // sound sample rate (i.e., 44100)          \n"
-		"uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)           \n"
-		"uniform float     iChannelTime[4];       // channel playback time (in sec)           \n"
 		"                                                                                     \n"
 		"// Shader body                                                                       \n"
 		"%s                                                                                   \n"
@@ -105,9 +102,6 @@ static const char *shadertoy_fs_tmpl_300 =
 		"uniform int       iFrame;                // current frame number                     \n"
 		"uniform vec4      iMouse;                // mouse pixel coords                       \n"
 		"uniform vec4      iDate;                 // (year, month, day, time in seconds)      \n"
-		"uniform float     iSampleRate;           // sound sample rate (i.e., 44100)          \n"
-		"uniform vec3      iChannelResolution[4]; // channel resolution (in pixels)           \n"
-		"uniform float     iChannelTime[4];       // channel playback time (in sec)           \n"
 		"                                                                                     \n"
 		"// Shader body                                                                       \n"
 		"%s                                                                                   \n"
@@ -199,11 +193,47 @@ static char *glsl_version() {
 	return version;
 }
 
+typedef void (*onInitCallback)(uint program, uint width, uint height);
+typedef void (*onRenderCallback)(uint64_t frame, float time);
+
+typedef struct {
+	void (**callbacks)();
+	size_t length;
+} Callbacks;
+
+void addCallback(Callbacks *callbacks, void callback()) {
+	if (!callbacks->callbacks) {
+		callbacks->length = 1;
+		callbacks->callbacks = malloc(sizeof(callbacks->callbacks));
+		callbacks->callbacks[0] = callback;
+	} else {
+		callbacks->length++;
+		callbacks->callbacks = realloc(callbacks->callbacks, callbacks->length * sizeof(callbacks->callbacks));
+		callbacks->callbacks[callbacks->length - 1] = callback;
+	}
+}
+
+Callbacks onInitCallbacks;
+void onInit(onInitCallback callback) {
+	addCallback(&onInitCallbacks, (void (*)) callback);
+}
+
+Callbacks onRenderCallbacks;
+void onRender(onRenderCallback callback) {
+	addCallback(&onRenderCallbacks, (void (*)) callback);
+}
+
 static void draw_shadertoy(uint64_t start_time, unsigned frame) {
-	glUniform1f(iTime, (GLfloat) (get_time_ns() - start_time) / NSEC_PER_SEC);
+	float time = ((float) (get_time_ns() - start_time)) / NSEC_PER_SEC;
+
+	glUniform1f(iTime, time);
 	// Replace the above to input elapsed time relative to 60 FPS
 	// glUniform1f(iTime, (GLfloat) frame / 60.0f);
 	glUniform1ui(iFrame, frame);
+
+	for (uint i = 0; i < onRenderCallbacks.length; i++) {
+		((onRenderCallback) onRenderCallbacks.callbacks[i])(frame, time);
+	}
 
 	start_perfcntrs();
 
@@ -256,10 +286,16 @@ int init_shadertoy(const struct gbm *gbm, struct egl *egl, const char *file) {
 
 	glViewport(0, 0, gbm->width, gbm->height);
 	glUseProgram(program);
+
 	iTime = glGetUniformLocation(program, "iTime");
 	iFrame = glGetUniformLocation(program, "iFrame");
 	iResolution = glGetUniformLocation(program, "iResolution");
 	glUniform3f(iResolution, gbm->width, gbm->height, 0);
+
+	for (uint i = 0; i < onInitCallbacks.length; i++) {
+		((onInitCallback) onInitCallbacks.callbacks[i])(program, gbm->width, gbm->height);
+	}
+
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
 	glBufferData(GL_ARRAY_BUFFER, sizeof(vertices), 0, GL_STATIC_DRAW);

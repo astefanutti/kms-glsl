@@ -27,9 +27,6 @@
 #include <xf86drm.h>
 #include <xf86drmMode.h>
 
-struct gbm;
-struct egl;
-
 struct plane {
 	drmModePlane *plane;
 	drmModeObjectProperties *props;
@@ -61,10 +58,12 @@ struct drm {
 	uint32_t crtc_id;
 	uint32_t connector_id;
 
+	bool async_page_flip;
+
 	/* number of frames to run for: */
 	unsigned int count;
 
-	int (*run)(const struct gbm *gbm, const struct egl *egl, const struct options *options);
+	int (*run)(const struct gbm *gbm, const struct egl *egl);
 };
 
 struct drm_fb {
@@ -75,8 +74,8 @@ struct drm_fb {
 struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo);
 
 int find_drm_device();
-int init_drm(struct drm *drm, int fd, const char *mode_str, const struct options *options);
-const struct drm * init_drm_legacy(int fd, const char *mode_str, const struct options *options);
-const struct drm * init_drm_atomic(int fd, const char *mode_str, const struct options *options);
+int init_drm(struct drm *drm, int fd, const struct options *options);
+const struct drm * init_drm_legacy(int fd, const struct options *options);
+const struct drm * init_drm_atomic(int fd, const struct options *options);
 
 #endif /* _DRM_COMMON_H */

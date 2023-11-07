@@ -28,6 +28,7 @@
 #include <stdlib.h>
 #include <getopt.h>
 #include <fcntl.h>
+#include <pthread.h>
 
 #include "common.h"
 #include "drm-common.h"
@@ -59,7 +60,7 @@ static void usage(const char *name) {
 		   "\n"
 		   "options:\n"
 		   "    -a, --async              use async page flipping\n"
-		   "    -A, --atomic             use atomic modesetting and fencing\n"
+		   "    -A, --atomic             use atomic mode setting and fencing\n"
 		   "    -c, --count              run for the specified number of frames\n"
 		   "    -D, --device=DEVICE      use the given device\n"
 		   "    -f, --format=FOURCC      framebuffer format\n"
@@ -74,92 +75,12 @@ static void usage(const char *name) {
 		   name);
 }
 
-int main(int argc, char *argv[]) {
-	const char *device = NULL;
-	const char *shadertoy = NULL;
-	const char *perfcntr = NULL;
-	char mode_str[DRM_DISPLAY_MODE_LEN] = "";
-	uint32_t format = DRM_FORMAT_XRGB8888;
-	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
-
-	struct options options = {
-		.count = 0,
-	};
-
+int init(const char *shadertoy, const struct options *options) {
 	int ret;
-
-	char *p;
-	int opt;
-	unsigned int len;
-	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
-		switch (opt) {
-			case 'a':
-				options.async_page_flip = true;
-				break;
-			case 'A':
-				options.drm_mode_atomic = true;
-				break;
-			case 'c':
-				options.count = strtoul(optarg, NULL, 0);
-				break;
-			case 'D':
-				device = optarg;
-				break;
-			case 'f': {
-				char fourcc[4] = "    ";
-				int length = strlen(optarg);
-				if (length > 0)
-					fourcc[0] = optarg[0];
-				if (length > 1)
-					fourcc[1] = optarg[1];
-				if (length > 2)
-					fourcc[2] = optarg[2];
-				if (length > 3)
-					fourcc[3] = optarg[3];
-				format = fourcc_code(fourcc[0], fourcc[1],
-									 fourcc[2], fourcc[3]);
-				break;
-			}
-			case 'h':
-				usage(argv[0]);
-				return 0;
-			case 'm':
-				modifier = strtoull(optarg, NULL, 0);
-				break;
-			case 'p':
-				perfcntr = optarg;
-				break;
-			case 'v':
-				p = strchr(optarg, '-');
-				if (p == NULL) {
-					len = strlen(optarg);
-				} else {
-					options.vrefresh = strtoul(p + 1, NULL, 0);
-					len = p - optarg;
-				}
-				if (len > sizeof(mode_str) - 1)
-					len = sizeof(mode_str) - 1;
-				strncpy(mode_str, optarg, len);
-				mode_str[len] = '\0';
-				break;
-			case 'x':
-				options.surfaceless = true;
-				break;
-			default:
-				usage(argv[0]);
-				return -1;
-		}
-	}
-
-	if (argc - optind != 1) {
-		usage(argv[0]);
-		return -1;
-	}
-	shadertoy = argv[optind];
-
 	int fd;
-	if (device) {
-		fd = open(device, O_RDWR);
+
+	if (options->device) {
+		fd = open(options->device, O_RDWR);
 	} else {
 #if XCB_LEASE
 		xcb_connection_t *connection;
@@ -192,17 +113,25 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
-	if (options.drm_mode_atomic) {
-		drm = init_drm_atomic(fd, mode_str, &options);
+	if (options->atomic_drm_mode) {
+		drm = init_drm_atomic(fd, options);
 	} else {
-		drm = init_drm_legacy(fd, mode_str, &options);
+		drm = init_drm_legacy(fd, options);
 	}
 	if (!drm) {
-		printf("failed to initialize %s DRM\n", options.drm_mode_atomic ? "atomic" : "legacy");
+		printf("failed to initialize %s DRM\n", options->atomic_drm_mode ? "atomic" : "legacy");
 		return -1;
 	}
 
-	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay, format, modifier, options.surfaceless);
+	uint32_t format = DRM_FORMAT_XRGB8888;
+	if (options->format) {
+		format = options->format;
+	}
+	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+	if (options->modifier) {
+		modifier = options->modifier;
+	}
+	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay, format, modifier, options->surfaceless);
 	if (!gbm) {
 		printf("failed to initialize GBM\n");
 		return -1;
@@ -219,12 +148,113 @@ int main(int argc, char *argv[]) {
 		return -1;
 	}
 
+	glClearColor((GLfloat) 0.5, (GLfloat) 0.5, (GLfloat) 0.5, (GLfloat) 1.0);
+	glClear(GL_COLOR_BUFFER_BIT);
+
+	return 0;
+}
+
+int main(int argc, char *argv[]) {
+	const char *shadertoy = NULL;
+	const char *perfcntr = NULL;
+
+	struct options options = {
+		.count = 0,
+		.mode = "",
+	};
+
+	int ret;
+
+	char *p;
+	int opt;
+	unsigned int len;
+	while ((opt = getopt_long_only(argc, argv, shortopts, longopts, NULL)) != -1) {
+		switch (opt) {
+			case 'a':
+				options.async_page_flip = true;
+				break;
+			case 'A':
+				options.atomic_drm_mode = true;
+				break;
+			case 'c':
+				options.count = strtoul(optarg, NULL, 0);
+				break;
+			case 'D':
+				options.device = optarg;
+				break;
+			case 'f': {
+				char fourcc[4] = "    ";
+				uint length = strlen(optarg);
+				if (length > 0)
+					fourcc[0] = optarg[0];
+				if (length > 1)
+					fourcc[1] = optarg[1];
+				if (length > 2)
+					fourcc[2] = optarg[2];
+				if (length > 3)
+					fourcc[3] = optarg[3];
+				options.format = fourcc_code(fourcc[0], fourcc[1], fourcc[2], fourcc[3]);
+				break;
+			}
+			case 'h':
+				usage(argv[0]);
+				return 0;
+			case 'm':
+				options.modifier = strtoull(optarg, NULL, 0);
+				break;
+			case 'p':
+				perfcntr = optarg;
+				break;
+			case 'v':
+				p = strchr(optarg, '-');
+				if (p == NULL) {
+					len = strlen(optarg);
+				} else {
+					options.vrefresh = strtoul(p + 1, NULL, 0);
+					len = p - optarg;
+				}
+				if (len > sizeof(options.mode) - 1)
+					len = sizeof(options.mode) - 1;
+				strncpy(options.mode, optarg, len);
+				options.mode[len] = '\0';
+				break;
+			case 'x':
+				options.surfaceless = true;
+				break;
+			default:
+				usage(argv[0]);
+				return -1;
+		}
+	}
+
+	if (argc - optind != 1) {
+		usage(argv[0]);
+		return -1;
+	}
+	shadertoy = argv[optind];
+
+	ret = init(shadertoy, &options);
+	if (ret < 0) {
+		return -1;
+	}
+
 	if (perfcntr) {
 		init_perfcntrs(egl, perfcntr);
 	}
 
-	glClearColor(0.5, 0.5, 0.5, 1.0);
-	glClear(GL_COLOR_BUFFER_BIT);
+	return drm->run(gbm, egl);
+}
 
-	return drm->run(gbm, egl, &options);
+void *thread_run() {
+	eglMakeCurrent(egl->display, egl->surface, egl->surface, egl->context);
+
+	return (void *) drm->run(gbm, egl);
+}
+
+int run() {
+	pthread_t thread;
+
+	eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
+
+	return pthread_create(&thread, NULL, thread_run, NULL);
 }

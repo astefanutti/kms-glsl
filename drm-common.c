@@ -22,7 +22,6 @@
  */
 
 #include <errno.h>
-#include <inttypes.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -213,8 +212,7 @@ int find_drm_device()
 	return fd;
 }
 
-int init_drm(struct drm *drm, const int fd, const char *mode_str,
-		 const struct options *options)
+int init_drm(struct drm *drm, const int fd, const struct options *options)
 {
 	drmModeRes *resources;
 	drmModeConnector *connector = NULL;
@@ -242,18 +240,18 @@ int init_drm(struct drm *drm, const int fd, const char *mode_str,
 
 	if (!connector) {
 		/* we could be fancy and listen for hotplug events and wait for
-		 * a connector..
+		 * a connector.
 		 */
 		printf("no connected connector!\n");
 		return -1;
 	}
 
 	/* find user requested mode: */
-	if (mode_str && *mode_str) {
+	if (/*options->mode && */*options->mode) {
 		for (i = 0; i < connector->count_modes; i++) {
 			drmModeModeInfo *current_mode = &connector->modes[i];
 
-			if (strcmp(current_mode->name, mode_str) == 0) {
+			if (strcmp(current_mode->name, options->mode) == 0) {
 				if (options->vrefresh == 0 || current_mode->vrefresh == options->vrefresh) {
 					drm->mode = current_mode;
 					break;

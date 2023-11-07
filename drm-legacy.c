@@ -42,7 +42,7 @@ static void page_flip_handler(int fd, unsigned int frame,
 	*waiting_for_flip = 0;
 }
 
-static int legacy_run(const struct gbm *gbm, const struct egl *egl, const struct options *options)
+static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 {
 	fd_set fds;
 	drmEventContext evctx = {
@@ -77,7 +77,7 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl, const struct
 
 	uint32_t flags;
 
-	if (options->async_page_flip) {
+	if (drm.async_page_flip) {
 		flags = DRM_MODE_PAGE_FLIP_ASYNC;
 	} else {
 		flags = DRM_MODE_PAGE_FLIP_EVENT;
@@ -134,7 +134,7 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl, const struct
 			return -1;
 		}
 
-		if (!options->async_page_flip) {
+		if (!drm.async_page_flip) {
 			while (waiting_for_flip) {
 				FD_ZERO(&fds);
 				FD_SET(0, &fds);
@@ -186,16 +186,16 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl, const struct
 	return 0;
 }
 
-const struct drm * init_drm_legacy(int fd, const char *mode_str,
-		const struct options *options)
+const struct drm * init_drm_legacy(int fd, const struct options *options)
 {
 	int ret;
 
-	ret = init_drm(&drm, fd, mode_str, options);
+	ret = init_drm(&drm, fd, options);
 	if (ret)
 		return NULL;
 
 	drm.run = legacy_run;
+	drm.async_page_flip = options->async_page_flip;
 
 	return &drm;
 }

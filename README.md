@@ -17,6 +17,8 @@ In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view
 
 ## Build
 
+You need to clone the project, and run the following commands:
+
 ```shell
 $ sudo apt update
 # Install the build tools
@@ -25,11 +27,73 @@ $ sudo apt install gcc make
 $ sudo apt install libdrm-dev libgbm-dev libegl-dev libgles2-mesa-dev
 # Install the X C binding and RandR extension header / library files (optional)
 $ sudo apt install libxcb-randr0-dev
-# Build the glsl CLI binary
+# Build the glsl binary and library
 $ make
 ```
 
 ## Usage
+
+Once you've successfully built the binary / library, you can either run it directly, or use the Python wrapper, as explained below.
+
+### Python
+
+KMS GLSL comes with a Python wrapper around the native library, that adds a layer for managing shader inputs, that you can also extend to add your own inputs, as well as an augmented CLI:
+
+```console
+$ python glsl.py -h
+usage: glsl.py [-h] [--async-page-flip | --no-async-page-flip]
+               [--atomic-drm-mode | --no-atomic-drm-mode] [-D DEVICE] [--mode MODE]
+               [-k UNIFORM] [--touch UNIFORM] [-c UNIFORM FILE] [-t UNIFORM FILE]
+               [-v UNIFORM FILE] [-m <UNIFORM>.KEY VALUE]
+               FILE
+
+Run OpenGL shaders using DRM/KMS
+
+positional arguments:
+  FILE                  the shader file
+
+optional arguments:
+  -h, --help            show this help message and exit
+  --async-page-flip, --no-async-page-flip
+                        use async page flipping
+  --atomic-drm-mode, --no-atomic-drm-mode
+                        use atomic mode setting and fencing
+  -D DEVICE, --device DEVICE
+                        the DRM device
+  --mode MODE           specify the video mode in the format
+                        <resolution>[-<vrefresh>]
+  -k UNIFORM, --keyboard UNIFORM
+                        add keyboard
+  --touch UNIFORM       add touch device
+  -c UNIFORM FILE, --cubemap UNIFORM FILE
+                        add cubemap
+  -t UNIFORM FILE, --texture UNIFORM FILE
+                        add texture
+  -v UNIFORM FILE, --volume UNIFORM FILE
+                        add volume
+  -m <UNIFORM>.KEY VALUE, --metadata <UNIFORM>.KEY VALUE
+                        set uniform metadata
+```
+
+You can try it with the shaders copied from Shadertoy available in the `examples` directory, e.g.:
+
+```shell
+$ python glsl.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
+```
+
+Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
+You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
+
+> [!NOTE]
+> [Shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
+>
+> The shaders from the `examples` directory assume OpenGL ES 3.1 support, and may not work with lower versions of the specification.
+
+You can find the documentation on how to add your own inputs in the `glsl.py` file.
+
+### Native
+
+If you cannot, or don't want to, use Python, you can directly use the native CLI:
 
 ```console
 $ ./glsl -h
@@ -37,7 +101,7 @@ Usage: ./glsl [-aAcDfmpvx] <shader_file>
 
 options:
     -a, --async              use async page flipping
-    -A, --atomic             use atomic modesetting and fencing
+    -A, --atomic             use atomic mode setting and fencing
     -c, --count              run for the specified number of frames
     -D, --device=DEVICE      use the given device
     -f, --format=FOURCC      framebuffer format
@@ -51,18 +115,7 @@ options:
     -x, --surfaceless        use surfaceless mode, instead of GBM surface
 ```
 
-You can try with the shaders copied from Shadertoy into the `examples` directory, e.g.:
-
-```shell
-$ ./glsl examples/stripey_torus_interior.glsl
-```
-
-Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
-You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
-
-> :warning: [Image shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
->
-> Note the shaders from the `examples` directory assume OpenGL ES 3.1 support, and may not work with lower versions of the specification.
+Note no inputs can be provided using the native CLI directly.
 
 ## Raspberry Pi
 
@@ -95,11 +148,9 @@ It has successfully been tested on the RPi 4, running the Raspberry Pi OS 2023-0
 
 ## Roadmap
 
-- Feed the mouse uniform and keyboard texture
-- Feed arbitrary variables / buffers from different languages / runtimes (Python, Node.js, ...)
-- Feed audio / video inputs to microphone / camera textures
-- Package Shadertoy default textures (image, font, noise, ...)
-- Load arbitrary texture files
+- Add support for texture buffers
+- Add support for audio / video inputs
+- Parse GLSL files to retrieve uniforms metadata
 
 ## Credits
 
