@@ -33,11 +33,47 @@ $ make
 
 ## Usage
 
-Once you've successfully built the binary / library, you can either run it directly, or use the Python wrapper, as explained below.
+Once you've successfully built the binary / library, you can either run it directly, or use the Python wrapper, that adds a layer for managing shader inputs, that you can also extend to add your own custom inputs.
+
+### Native
+
+```console
+$ ./glsl -h
+Usage: ./glsl [-aAcDfmpvx] <shader_file>
+
+options:
+    -a, --async              use async page flipping
+    -A, --atomic             use atomic mode setting and fencing
+    -c, --count              run for the specified number of frames
+    -D, --device=DEVICE      use the given device
+    -f, --format=FOURCC      framebuffer format
+    -h, --help               print usage
+    -m, --modifier=MODIFIER  hardcode the selected modifier
+    -p, --perfcntr=LIST      sample specified performance counters using
+                             the AMD_performance_monitor extension (comma
+                             separated list)
+    -v, --vmode=VMODE        specify the video mode in the format
+                             <mode>[-<vrefresh>]
+    -x, --surfaceless        use surfaceless mode, instead of GBM surface
+```
+
+> [!NOTE]
+> [Shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
+
+You can try it with the shaders available in the `examples` directory, e.g.:
+
+```shell
+$ ./glsl examples/costal_landscape.glsl
+```
+
+Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
+You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
+Note the shaders from the `examples` directory assume OpenGL ES 3.1 support, and may not work with lower versions of the specification.
+
+No inputs can be provided using the native CLI directly.
+You can use the Python wrapper, that adds a layer around the native library for managing shader inputs, as explained below.
 
 ### Python
-
-KMS GLSL comes with a Python wrapper around the native library, that adds a layer for managing shader inputs, that you can also extend to add your own inputs, as well as an augmented CLI:
 
 ```console
 $ python glsl.py -h
@@ -75,7 +111,10 @@ optional arguments:
                         set uniform metadata
 ```
 
-You can try it with the shaders copied from Shadertoy available in the `examples` directory, e.g.:
+> [!NOTE]
+> Python 3.10+ is required.
+
+You can try it with the shaders available in the `examples` directory, e.g.:
 
 ```shell
 $ python glsl.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
@@ -84,38 +123,7 @@ $ python glsl.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_
 Press <kbd>Ctrl</kbd>+<kbd>c</kbd> to exit the program.
 You can explore [shadertoy.com](https://www.shadertoy.com) to find additional shaders.
 
-> [!NOTE]
-> [Shaders](https://www.shadertoy.com/howto#q1) from [Shadertoy](https://www.shadertoy.com/) are currently expected as input shader files.
->
-> The shaders from the `examples` directory assume OpenGL ES 3.1 support, and may not work with lower versions of the specification.
-
-You can find the documentation on how to add your own inputs in the `glsl.py` file.
-
-### Native
-
-If you cannot, or don't want to, use Python, you can directly use the native CLI:
-
-```console
-$ ./glsl -h
-Usage: ./glsl [-aAcDfmpvx] <shader_file>
-
-options:
-    -a, --async              use async page flipping
-    -A, --atomic             use atomic mode setting and fencing
-    -c, --count              run for the specified number of frames
-    -D, --device=DEVICE      use the given device
-    -f, --format=FOURCC      framebuffer format
-    -h, --help               print usage
-    -m, --modifier=MODIFIER  hardcode the selected modifier
-    -p, --perfcntr=LIST      sample specified performance counters using
-                             the AMD_performance_monitor extension (comma
-                             separated list)
-    -v, --vmode=VMODE        specify the video mode in the format
-                             <mode>[-<vrefresh>]
-    -x, --surfaceless        use surfaceless mode, instead of GBM surface
-```
-
-Note no inputs can be provided using the native CLI directly.
+If you want to add your own inputs, you can find the documentation and some examples in the `glsl.py` file.
 
 ## Raspberry Pi
 
