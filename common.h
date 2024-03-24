@@ -80,7 +80,7 @@ EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformPixmapSurfaceEXT (EGLDisplay dpy,
 
 #define WEAK __attribute__((weak))
 
-/* Define tokens from EGL_EXT_image_dma_buf_import_modifiers */
+/* Define tokens and proc types from EGL_EXT_image_dma_buf_import_modifiers */
 #ifndef EGL_EXT_image_dma_buf_import_modifiers
 #define EGL_EXT_image_dma_buf_import_modifiers 1
 #define EGL_DMA_BUF_PLANE3_FD_EXT         0x3440
@@ -94,7 +94,12 @@ EGLAPI EGLSurface EGLAPIENTRY eglCreatePlatformPixmapSurfaceEXT (EGLDisplay dpy,
 #define EGL_DMA_BUF_PLANE2_MODIFIER_HI_EXT 0x3448
 #define EGL_DMA_BUF_PLANE3_MODIFIER_LO_EXT 0x3449
 #define EGL_DMA_BUF_PLANE3_MODIFIER_HI_EXT 0x344A
+
+typedef EGLBoolean (EGLAPIENTRYP PFNEGLQUERYDMABUFMODIFIERSEXTPROC) (EGLDisplay dpy, EGLint format, EGLint max_modifiers, EGLuint64KHR *modifiers, EGLBoolean *external_only, EGLint *num_modifiers);
+#ifdef EGL_EGLEXT_PROTOTYPES
+EGLAPI EGLBoolean EGLAPIENTRY eglQueryDmaBufModifiersEXT (EGLDisplay dpy, EGLint format, EGLint max_modifiers, EGLuint64KHR *modifiers, EGLBoolean *external_only, EGLint *num_modifiers);
 #endif
+#endif /* EGL_EXT_image_dma_buf_import_modifiers */
 
 #define NUM_BUFFERS 2
 
@@ -111,6 +116,7 @@ struct options {
 };
 
 struct gbm {
+	const struct drm *drm;
 	struct gbm_device *dev;
 	struct gbm_surface *surface;
 	struct gbm_bo *bos[NUM_BUFFERS];    /* for the surfaceless case */
@@ -118,7 +124,7 @@ struct gbm {
 	int width, height;
 };
 
-const struct gbm * init_gbm(int drm_fd, int w, int h, uint32_t format, uint64_t modifier, bool surfaceless);
+const struct gbm * init_gbm_device(const struct drm *drm, uint32_t format);
 
 struct framebuffer {
 	EGLImageKHR image;
@@ -137,6 +143,7 @@ struct egl {
 	PFNEGLCREATEIMAGEKHRPROC eglCreateImageKHR;
 	PFNEGLDESTROYIMAGEKHRPROC eglDestroyImageKHR;
 	PFNGLEGLIMAGETARGETTEXTURE2DOESPROC glEGLImageTargetTexture2DOES;
+	PFNEGLQUERYDMABUFMODIFIERSEXTPROC eglQueryDmaBufModifiersEXT;
 	PFNEGLCREATESYNCKHRPROC eglCreateSyncKHR;
 	PFNEGLDESTROYSYNCKHRPROC eglDestroySyncKHR;
 	PFNEGLWAITSYNCKHRPROC eglWaitSyncKHR;
@@ -158,6 +165,9 @@ struct egl {
 
 	bool modifiers_supported;
 
+	EGLuint64KHR *modifiers;
+	EGLint num_modifiers;
+
 	void (*draw)(uint64_t start_time, unsigned frame);
 };
 
@@ -172,7 +182,7 @@ static inline int __egl_check(void *ptr, const char *name)
 
 #define egl_check(egl, name) __egl_check((egl)->name, #name)
 
-const struct egl * init_egl(const struct gbm *gbm);
+const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfaceless);
 
 int create_program(const char *vs_src, const char *fs_src);
 int link_program(unsigned program);

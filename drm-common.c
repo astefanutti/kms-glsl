@@ -46,8 +46,7 @@ gbm_bo_get_stride_for_plane(struct gbm_bo *bo, int plane);
 WEAK uint32_t
 gbm_bo_get_offset(struct gbm_bo *bo, int plane);
 
-static void
-drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
+static void drm_fb_destroy_callback(struct gbm_bo *bo, void *data)
 {
 	int drm_fd = gbm_device_get_fd(gbm_bo_get_device(bo));
 	struct drm_fb *fb = data;
@@ -123,7 +122,8 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo)
 }
 
 static int32_t find_crtc_for_encoder(const drmModeRes *resources,
-		const drmModeEncoder *encoder) {
+                                     const drmModeEncoder *encoder)
+{
 	int i;
 
 	for (i = 0; i < resources->count_crtcs; i++) {
@@ -141,8 +141,10 @@ static int32_t find_crtc_for_encoder(const drmModeRes *resources,
 	return -1;
 }
 
-static int32_t find_crtc_for_connector(const struct drm *drm, const drmModeRes *resources,
-		const drmModeConnector *connector) {
+static int32_t find_crtc_for_connector(const struct drm *drm,
+                                       const drmModeRes *resources,
+                                       const drmModeConnector *connector)
+{
 	int i;
 
 	for (i = 0; i < connector->count_encoders; i++) {
@@ -319,4 +321,16 @@ int init_drm(struct drm *drm, const int fd, const struct options *options)
 	drm->count = options->count;
 
 	return 0;
+}
+
+const uint64_t *get_drm_format_modifiers(const struct drm *drm,
+                                         unsigned int *count)
+{
+	if (drm->plane) {
+		*count = drm->plane->num_modifiers;
+		return drm->plane->modifiers;
+	}
+
+	*count = 0;
+	return NULL;
 }

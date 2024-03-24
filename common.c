@@ -1,6 +1,8 @@
 /*
+ * Copyright (c) 2013 Intel Corporation
  * Copyright (c) 2017 Rob Clark <rclark@redhat.com>
- * Copyright © 2013 Intel Corporation
+ * Copyright (c) 2019 NVIDIA Corporation
+ * Copyright (c) 2024 Antonin Stefanutti <antonin.stefanutti@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
  * copy of this software and associated documentation files (the "Software"),
@@ -32,6 +34,7 @@
 #include <unistd.h>
 
 #include "common.h"
+#include "drm-common.h"
 
 static struct gbm gbm;
 static struct egl egl;
@@ -49,100 +52,102 @@ gbm_bo_create_with_modifiers(struct gbm_device *gbm,
 				const uint64_t *modifiers,
 				const unsigned int count);
 
-static struct gbm_bo * init_bo(uint64_t modifier)
+const struct gbm *init_gbm_device(const struct drm *drm, uint32_t format)
+{
+	gbm.drm = drm;
+
+	gbm.dev = gbm_create_device(drm->fd);
+	if (!gbm.dev) {
+		fprintf(stderr, "Failed to create a GBM device on fd %d\n", drm->fd);
+		return NULL;
+	}
+
+	gbm.format = format;
+	gbm.width = drm->mode->hdisplay;
+	gbm.height = drm->mode->vdisplay;
+	gbm.surface = NULL;
+
+	return &gbm;
+}
+
+static int init_gbm_surface(const uint64_t *modifiers,
+                            const unsigned int count)
+{
+	if (gbm_surface_create_with_modifiers) {
+		gbm.surface = gbm_surface_create_with_modifiers(gbm.dev,
+		                                                gbm.width,
+		                                                gbm.height,
+		                                                gbm.format,
+		                                                modifiers, count);
+	}
+
+	if (!gbm.surface) {
+		if (count > 0 && modifiers[0] != DRM_FORMAT_MOD_LINEAR) {
+			fprintf(stderr, "Modifiers requested but support isn't available\n");
+			return -1;
+		}
+		gbm.surface = gbm_surface_create(gbm.dev,
+		                                 gbm.width,
+		                                 gbm.height,
+		                                 gbm.format,
+		                                 GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+	}
+
+	if (!gbm.surface) {
+		printf("Failed to create GBM surface\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static struct gbm_bo *init_gbm_bo(const uint64_t *modifiers,
+                                  const unsigned int count)
 {
 	struct gbm_bo *bo = NULL;
 
 	if (gbm_bo_create_with_modifiers) {
 		bo = gbm_bo_create_with_modifiers(gbm.dev,
-						gbm.width, gbm.height,
-						gbm.format,
-						&modifier, 1);
+		                                  gbm.width, gbm.height,
+		                                  gbm.format,
+		                                  modifiers, count);
 	}
 
 	if (!bo) {
-		if (modifier != DRM_FORMAT_MOD_LINEAR) {
+		if (count > 0 && modifiers[0] != DRM_FORMAT_MOD_LINEAR) {
 			fprintf(stderr, "Modifiers requested but support isn't available\n");
 			return NULL;
 		}
 
 		bo = gbm_bo_create(gbm.dev,
-				gbm.width, gbm.height,
-				gbm.format,
-				GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
+		                   gbm.width, gbm.height,
+		                   gbm.format,
+		                   GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
 	}
 
 	if (!bo) {
-		printf("failed to create gbm bo\n");
+		printf("Failed to create GBM BO\n");
 		return NULL;
 	}
 
 	return bo;
 }
 
-static struct gbm * init_surfaceless(uint64_t modifier)
+static int init_gbm_buffer_objects(const uint64_t *modifiers,
+                                   const unsigned int count)
 {
 	for (unsigned i = 0; i < ARRAY_SIZE(gbm.bos); i++) {
-		gbm.bos[i] = init_bo(modifier);
+		gbm.bos[i] = init_gbm_bo(modifiers, count);
 		if (!gbm.bos[i])
-			return NULL;
+			return -1;
 	}
-	return &gbm;
-}
-
-static struct gbm * init_surface(uint64_t modifier)
-{
-	if (gbm_surface_create_with_modifiers) {
-		gbm.surface = gbm_surface_create_with_modifiers(gbm.dev,
-								gbm.width, gbm.height,
-								gbm.format,
-								&modifier, 1);
-
-	}
-
-	if (!gbm.surface) {
-		if (modifier != DRM_FORMAT_MOD_LINEAR) {
-			fprintf(stderr, "Modifiers requested but support isn't available\n");
-			return NULL;
-		}
-		gbm.surface = gbm_surface_create(gbm.dev,
-						gbm.width, gbm.height,
-						gbm.format,
-						GBM_BO_USE_SCANOUT | GBM_BO_USE_RENDERING);
-
-	}
-
-	if (!gbm.surface) {
-		printf("failed to create GBM surface\n");
-		return NULL;
-	}
-
-	return &gbm;
-}
-
-const struct gbm * init_gbm(int drm_fd, int w, int h, uint32_t format,
-		uint64_t modifier, bool surfaceless)
-{
-	gbm.dev = gbm_create_device(drm_fd);
-	if (!gbm.dev)
-		return NULL;
-
-	gbm.format = format;
-	gbm.surface = NULL;
-
-	gbm.width = w;
-	gbm.height = h;
-
-	if (surfaceless)
-		return init_surfaceless(modifier);
-
-	return init_surface(modifier);
+	return 0;
 }
 
 static bool has_ext(const char *extension_list, const char *ext)
 {
 	const char *ptr = extension_list;
-	int len = strlen(ext);
+	size_t len = strlen(ext);
 
 	if (ptr == NULL || *ptr == '\0')
 		return false;
@@ -159,11 +164,10 @@ static bool has_ext(const char *extension_list, const char *ext)
 	}
 }
 
-static int
-match_config_to_visual(EGLDisplay egl_display,
-			EGLint visual_id,
-			EGLConfig *configs,
-			int count)
+static int match_config_to_visual(EGLDisplay egl_display,
+                                  EGLint visual_id,
+                                  EGLConfig *configs,
+                                  int count)
 {
 	int i;
 
@@ -182,9 +186,8 @@ match_config_to_visual(EGLDisplay egl_display,
 	return -1;
 }
 
-static bool
-egl_choose_config(EGLDisplay egl_display, const EGLint *attribs,
-				EGLint visual_id, EGLConfig *config_out)
+static bool egl_choose_config(EGLDisplay egl_display, const EGLint *attribs,
+                              EGLint visual_id, EGLConfig *config_out)
 {
 	EGLint count = 0;
 	EGLint matched = 0;
@@ -225,9 +228,9 @@ out:
 	return true;
 }
 
-static bool
-create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
-		struct framebuffer *fb) {
+static bool create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
+                               struct framebuffer *fb)
+{
 	assert(egl->eglCreateImageKHR);
 	assert(bo);
 	assert(fb);
@@ -301,7 +304,91 @@ create_framebuffer(const struct egl *egl, struct gbm_bo *bo,
 	return true;
 }
 
-const struct egl * init_egl(const struct gbm *gbm)
+int init_egl_modifiers(struct egl *egl, const struct drm *drm,
+                       unsigned int format)
+{
+	EGLBoolean *extern_only;
+	EGLint i, j;
+	unsigned int num_drm_mods;
+	const uint64_t *drm_mods = get_drm_format_modifiers(drm, &num_drm_mods);
+
+	if (!egl->eglQueryDmaBufModifiersEXT(egl->display,
+	                                     format,
+	                                     0,
+	                                     NULL,
+	                                     NULL,
+	                                     &egl->num_modifiers)) {
+		printf("Failed to query number of modifiers for format 0x%x\n",
+		       format);
+		return -1;
+	}
+
+	egl->modifiers = malloc(sizeof(egl->modifiers[0]) *
+	                        egl->num_modifiers);
+	extern_only = malloc(sizeof(extern_only[0]) * egl->num_modifiers);
+
+	if (!egl->modifiers || !extern_only) {
+		printf("Failed to allocate modifier array\n");
+		free(egl->modifiers);
+		free(extern_only);
+		egl->modifiers = NULL;
+		egl->num_modifiers = 0;
+		return -1;
+	}
+
+	if (!egl->eglQueryDmaBufModifiersEXT(egl->display,
+	                                     format,
+	                                     egl->num_modifiers,
+	                                     egl->modifiers,
+	                                     extern_only,
+	                                     &egl->num_modifiers)) {
+		printf("Failed to query modifiers for format 0x%x\n", format);
+		free(extern_only);
+		free(egl->modifiers);
+		egl->modifiers = NULL;
+		egl->num_modifiers = 0;
+		return -1;
+	}
+
+	for (i = 0; i < egl->num_modifiers; i++) {
+		int remove = 0;
+		/* Filter out external-only modifiers. */
+		if (extern_only[i]) remove = 1;
+
+		/* Filter out modifiers incompatible with the DRM plane */
+		for (j = 0; j < (EGLint) num_drm_mods; j++) {
+			if (egl->modifiers[i] == drm_mods[j]) {
+				break;
+			}
+		}
+
+		if (num_drm_mods > 0 && j == (EGLint) num_drm_mods) remove = 1;
+
+		if (remove) {
+			/* Shift remaining modifiers down */
+			for (j = i + 1; j < egl->num_modifiers; j++) {
+				egl->modifiers[j - 1] = egl->modifiers[j];
+				extern_only[j - 1] = extern_only[j];
+			}
+			egl->num_modifiers--;
+		}
+	}
+
+	free(extern_only);
+
+	if (egl->num_modifiers <= 0) {
+		printf("No usable format modifiers found for format 0x%x\n",
+		       format);
+		free(egl->modifiers);
+		egl->modifiers = NULL;
+		egl->num_modifiers = 0;
+		return -1;
+	}
+
+	return 0;
+}
+
+const struct egl * init_egl(const struct gbm *gbm, uint64_t modifier, bool surfaceless)
 {
 	EGLint major, minor;
 
@@ -319,7 +406,10 @@ const struct egl * init_egl(const struct gbm *gbm)
 		EGL_RENDERABLE_TYPE, EGL_OPENGL_ES2_BIT,
 		EGL_NONE
 	};
+
 	const char *egl_exts_client, *egl_exts_dpy, *gl_exts;
+
+	int res;
 
 #define get_proc_client(ext, name) do { \
 		if (has_ext(egl_exts_client, #ext)) \
@@ -346,13 +436,14 @@ const struct egl * init_egl(const struct gbm *gbm)
 	}
 
 	if (!eglInitialize(egl.display, &major, &minor)) {
-		printf("failed to initialize\n");
+		printf("Failed to initialize EGL\n");
 		return NULL;
 	}
 
 	egl_exts_dpy = eglQueryString(egl.display, EGL_EXTENSIONS);
 	get_proc_dpy(EGL_KHR_image_base, eglCreateImageKHR);
 	get_proc_dpy(EGL_KHR_image_base, eglDestroyImageKHR);
+	get_proc_dpy(EGL_EXT_image_dma_buf_import_modifiers, eglQueryDmaBufModifiersEXT);
 	get_proc_dpy(EGL_KHR_fence_sync, eglCreateSyncKHR);
 	get_proc_dpy(EGL_KHR_fence_sync, eglDestroySyncKHR);
 	get_proc_dpy(EGL_KHR_fence_sync, eglWaitSyncKHR);
@@ -372,20 +463,46 @@ const struct egl * init_egl(const struct gbm *gbm)
 	printf("===================================\n");
 
 	if (!eglBindAPI(EGL_OPENGL_ES_API)) {
-		printf("failed to bind api EGL_OPENGL_ES_API\n");
+		printf("Failed to bind EGL_OPENGL_ES_API\n");
 		return NULL;
 	}
 
 	if (!egl_choose_config(egl.display, config_attribs, gbm->format,
 			&egl.config)) {
-		printf("failed to choose config\n");
+		printf("Failed to choose EGL config\n");
 		return NULL;
 	}
 
 	egl.context = eglCreateContext(egl.display, egl.config,
 			EGL_NO_CONTEXT, context_attribs);
 	if (egl.context == EGL_NO_CONTEXT) {
-		printf("failed to create context\n");
+		printf("Failed to create EGL context\n");
+		return NULL;
+	}
+
+	if (egl.modifiers_supported) {
+		if (modifier == DRM_FORMAT_MOD_INVALID &&
+		    init_egl_modifiers(&egl, gbm->drm, gbm->format)) {
+			printf("Not using modifiers\n");
+			egl.modifiers_supported = 0;
+			modifier = DRM_FORMAT_MOD_LINEAR;
+		}
+	}
+
+	int (*init_gbm)(const uint64_t *modifiers, const unsigned int count);
+	if (surfaceless) {
+		init_gbm = init_gbm_buffer_objects;
+	} else {
+		init_gbm = init_gbm_surface;
+	}
+
+	if (egl.num_modifiers) {
+		res = init_gbm(egl.modifiers, egl.num_modifiers);
+	} else {
+		res = init_gbm(&modifier, 1);
+	}
+	if (res) {
+		fprintf(stderr, "Failed to init GBM surface\n");
 		return NULL;
 	}
 
@@ -395,7 +512,7 @@ const struct egl * init_egl(const struct gbm *gbm)
 		egl.surface = eglCreateWindowSurface(egl.display, egl.config,
 				(EGLNativeWindowType)gbm->surface, NULL);
 		if (egl.surface == EGL_NO_SURFACE) {
-			printf("failed to create EGL surface\n");
+			printf("Failed to create EGL surface\n");
 			return NULL;
 		}
 	}
@@ -428,7 +545,7 @@ const struct egl * init_egl(const struct gbm *gbm)
 	if (!gbm->surface) {
 		for (unsigned i = 0; i < ARRAY_SIZE(gbm->bos); i++) {
 			if (!create_framebuffer(&egl, gbm->bos[i], &egl.fbs[i])) {
-				printf("failed to create framebuffer\n");
+				printf("Failed to create framebuffer\n");
 				return NULL;
 			}
 		}

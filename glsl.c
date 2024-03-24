@@ -30,7 +30,7 @@
 #include <fcntl.h>
 #include <pthread.h>
 
-#include "common.h"
+#include "glsl.h"
 #include "drm-common.h"
 
 #include "lease.h"
@@ -127,17 +127,17 @@ int init(const char *shadertoy, const struct options *options) {
 	if (options->format) {
 		format = options->format;
 	}
-	uint64_t modifier = DRM_FORMAT_MOD_LINEAR;
+	uint64_t modifier = DRM_FORMAT_MOD_INVALID;
 	if (options->modifier) {
 		modifier = options->modifier;
 	}
-	gbm = init_gbm(drm->fd, drm->mode->hdisplay, drm->mode->vdisplay, format, modifier, options->surfaceless);
+	gbm = init_gbm_device(drm, format);
 	if (!gbm) {
 		printf("failed to initialize GBM\n");
 		return -1;
 	}
 
-	egl = init_egl(gbm);
+	egl = init_egl(gbm, modifier, options->surfaceless);
 	if (!egl) {
 		printf("failed to initialize EGL\n");
 		return -1;
