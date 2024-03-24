@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2017 Rob Clark <rclark@redhat.com>
+ * Copyright (c) 2019 NVIDIA Corporation
  * Copyright (c) 2020 Antonin Stefanutti <antonin.stefanutti@gmail.com>
  *
  * Permission is hereby granted, free of charge, to any person obtaining a
@@ -35,7 +36,7 @@
 static struct drm drm;
 
 static int add_connector_property(drmModeAtomicReq *req, uint32_t obj_id,
-					const char *name, uint64_t value)
+                                  const char *name, uint64_t value)
 {
 	struct connector *obj = drm.connector;
 	unsigned int i;
@@ -57,7 +58,7 @@ static int add_connector_property(drmModeAtomicReq *req, uint32_t obj_id,
 }
 
 static int add_crtc_property(drmModeAtomicReq *req, uint32_t obj_id,
-				const char *name, uint64_t value)
+                             const char *name, uint64_t value)
 {
 	struct crtc *obj = drm.crtc;
 	unsigned int i;
@@ -78,26 +79,106 @@ static int add_crtc_property(drmModeAtomicReq *req, uint32_t obj_id,
 	return drmModeAtomicAddProperty(req, obj_id, prop_id, value);
 }
 
-static int add_plane_property(drmModeAtomicReq *req, uint32_t obj_id,
-				const char *name, uint64_t value)
+static int find_plane_prop(const char *name, unsigned int *prop_idx)
 {
 	struct plane *obj = drm.plane;
 	unsigned int i;
-	int prop_id = -1;
 
-	for (i = 0 ; i < obj->props->count_props ; i++) {
+	for (i = 0; i < obj->props->count_props; i++) {
 		if (strcmp(obj->props_info[i]->name, name) == 0) {
-			prop_id = obj->props_info[i]->prop_id;
 			break;
 		}
 	}
 
-	if (prop_id < 0) {
+	if (i == obj->props->count_props) {
 		printf("no plane property: %s\n", name);
 		return -EINVAL;
 	}
 
-	return drmModeAtomicAddProperty(req, obj_id, prop_id, value);
+	*prop_idx = i;
+
+	return 0;
+}
+
+static int add_plane_property(drmModeAtomicReq *req, uint32_t obj_id,
+                              const char *name, uint64_t value)
+{
+	struct plane *obj = drm.plane;
+	unsigned int prop_idx;
+	int res = find_plane_prop(name, &prop_idx);
+	const drmModePropertyRes *prop_info;
+
+	if (res) return res;
+
+	prop_info = obj->props_info[prop_idx];
+	return drmModeAtomicAddProperty(req, obj_id, prop_info->prop_id, value);
+}
+
+static int get_plane_property_val(const char *name, uint64_t *val)
+{
+	struct plane *obj = drm.plane;
+	unsigned int prop_idx;
+	int res = find_plane_prop(name, &prop_idx);
+
+	if (res) return res;
+
+	*val = obj->props->prop_values[prop_idx];
+
+	return 0;
+}
+
+static int get_plane_format_modifiers()
+{
+	struct plane *plane = drm.plane;
+	drmModePropertyBlobPtr blob;
+	struct drm_format_modifier_blob *format_blob;
+	struct drm_format_modifier *modifiers;
+	uint32_t *formats;
+	uint64_t blob_id;
+	int res;
+	uint32_t i;
+
+	if ((res = get_plane_property_val("IN_FORMATS", &blob_id))) return res;
+
+	blob = drmModeGetPropertyBlob(drm.fd, blob_id);
+
+	if (!blob) {
+		return -ENOMEM;
+	}
+
+	format_blob = blob->data;
+	plane->formats = calloc(format_blob->count_formats,
+	                        sizeof(plane->formats[0]));
+	plane->modifiers = calloc(format_blob->count_modifiers,
+	                          sizeof(plane->modifiers[0]));
+
+	if (!plane->formats || !plane->modifiers) {
+		free(plane->formats);
+		free(plane->modifiers);
+		return -ENOMEM;
+	}
+
+	formats = (uint32_t *) ((char *) format_blob +
+	                        format_blob->formats_offset);
+	modifiers = (struct drm_format_modifier *)
+			((char *) format_blob + format_blob->modifiers_offset);
+
+	memcpy(plane->formats, formats,
+	       sizeof(plane->formats[0]) * format_blob->count_formats);
+
+	for (i = 0; i < format_blob->count_modifiers; i++) {
+		/*
+		 * XXX Not quite right.  Should also stash which formats each
+		 * modifier supports next to it in a per-modifier array, or
+		 * vice-versa.
+		 */
+		plane->modifiers[i] = modifiers[i].modifier;
+	}
+
+	plane->num_formats = format_blob->count_formats;
+	plane->num_modifiers = format_blob->count_modifiers;
+
+	return 0;
 }
 
 static int drm_atomic_commit(uint32_t fb_id, uint32_t flags)
@@ -224,18 +305,20 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 		cur_time = get_time_ns();
 		if (cur_time > (report_time + 2 * NSEC_PER_SEC)) {
 			double elapsed_time = cur_time - start_time;
-			double secs = elapsed_time / (double)NSEC_PER_SEC;
+			double secs = elapsed_time / (double) NSEC_PER_SEC;
 			unsigned frames = i - 1;  /* first frame ignored */
 			printf("Rendered %u frames in %f sec (%f fps)\n",
-				frames, secs, (double)frames/secs);
+			       frames, secs, (double) frames / secs);
 			report_time = cur_time;
 		}
 
 		/* Check for user input: */
-		struct pollfd fdset[] = { {
-			.fd = STDIN_FILENO,
-			.events = POLLIN,
-		} };
+		struct pollfd fdset[] = {
+				{
+						.fd = STDIN_FILENO,
+						.events = POLLIN,
+				}
+		};
 		ret = poll(fdset, ARRAY_SIZE(fdset), 0);
 		if (ret > 0) {
 			printf("user interrupted!\n");
@@ -273,10 +356,10 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 
 	cur_time = get_time_ns();
 	double elapsed_time = cur_time - start_time;
-	double secs = elapsed_time / (double)NSEC_PER_SEC;
+	double secs = elapsed_time / (double) NSEC_PER_SEC;
 	unsigned frames = i - 1;  /* first frame ignored */
 	printf("Rendered %u frames in %f sec (%f fps)\n",
-		frames, secs, (double)frames/secs);
+	       frames, secs, (double) frames / secs);
 
 	dump_perfcntrs(frames, elapsed_time);
 
@@ -405,6 +488,8 @@ const struct drm * init_drm_atomic(int fd, const struct options *options)
 	get_properties(plane, PLANE, plane_id);
 	get_properties(crtc, CRTC, drm.crtc_id);
 	get_properties(connector, CONNECTOR, drm.connector_id);
+
+	get_plane_format_modifiers();
 
 	drm.run = atomic_run;
 	drm.async_page_flip = options->async_page_flip;
