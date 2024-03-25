@@ -52,7 +52,6 @@ struct connector {
 struct drm {
 	int fd;
 
-	/* only used for atomic: */
 	struct plane *plane;
 	struct crtc *crtc;
 	struct connector *connector;
@@ -79,12 +78,14 @@ struct drm_fb * drm_fb_get_from_bo(struct gbm_bo *bo);
 
 int find_drm_device();
 
+int find_plane_prop(const struct drm *drm, const char *name, unsigned int *prop_idx);
+
+const uint64_t *get_drm_format_modifiers(const struct drm *drm, unsigned int *count);
+
 int init_drm(struct drm *drm, int fd, const struct options *options);
 
 const struct drm *init_drm_legacy(int fd, const struct options *options);
 
 const struct drm *init_drm_atomic(int fd, const struct options *options);
-
-const uint64_t *get_drm_format_modifiers(const struct drm *drm, unsigned int *count);
 
 #endif /* _DRM_COMMON_H */
