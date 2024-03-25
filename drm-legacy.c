@@ -33,10 +33,10 @@
 static struct drm drm;
 
 static void page_flip_handler(int fd, unsigned int frame,
-			unsigned int sec, unsigned int usec, void *data)
+                              unsigned int sec, unsigned int usec, void *data)
 {
 	/* suppress 'unused parameter' warnings */
-	(void)fd, (void)frame, (void)sec, (void)usec;
+	(void) fd, (void) frame, (void) sec, (void) usec;
 
 	int *waiting_for_flip = data;
 	*waiting_for_flip = 0;
@@ -69,9 +69,9 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 
 	/* set mode: */
 	ret = drmModeSetCrtc(drm.fd, drm.crtc_id, fb->fb_id, 0, 0,
-			&drm.connector_id, 1, drm.mode);
+	                     &drm.connector_id, 1, drm.mode);
 	if (ret) {
-		printf("failed to set mode: %s\n", strerror(errno));
+		printf("Failed to set mode: %s\n", strerror(errno));
 		return ret;
 	}
 
@@ -128,7 +128,7 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 		 */
 
 		ret = drmModePageFlip(drm.fd, drm.crtc_id, fb->fb_id,
-				flags, &waiting_for_flip);
+		                      flags, &waiting_for_flip);
 		if (ret) {
 			printf("failed to queue page flip: %s\n", strerror(errno));
 			return -1;
@@ -158,10 +158,10 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 		cur_time = get_time_ns();
 		if (cur_time > (report_time + 2 * NSEC_PER_SEC)) {
 			double elapsed_time = cur_time - start_time;
-			double secs = elapsed_time / (double)NSEC_PER_SEC;
+			double secs = elapsed_time / (double) NSEC_PER_SEC;
 			unsigned frames = i - 1;  /* first frame ignored */
 			printf("Rendered %u frames in %f sec (%f fps)\n",
-				frames, secs, (double)frames/secs);
+			       frames, secs, (double) frames / secs);
 			report_time = cur_time;
 		}
 
@@ -176,10 +176,10 @@ static int legacy_run(const struct gbm *gbm, const struct egl *egl)
 
 	cur_time = get_time_ns();
 	double elapsed_time = cur_time - start_time;
-	double secs = elapsed_time / (double)NSEC_PER_SEC;
+	double secs = elapsed_time / (double) NSEC_PER_SEC;
 	unsigned frames = i - 1;  /* first frame ignored */
 	printf("Rendered %u frames in %f sec (%f fps)\n",
-		frames, secs, (double)frames/secs);
+	       frames, secs, (double) frames / secs);
 
 	dump_perfcntrs(frames, elapsed_time);
 
@@ -190,12 +190,17 @@ const struct drm * init_drm_legacy(int fd, const struct options *options)
 {
 	int ret;
 
+	ret = drmSetClientCap(fd, DRM_CLIENT_CAP_UNIVERSAL_PLANES, 1);
+	if (ret) {
+		printf("No universal planes support: %s\n", strerror(errno));
+		return NULL;
+	}
+
 	ret = init_drm(&drm, fd, options);
 	if (ret)
 		return NULL;
 
 	drm.run = legacy_run;
-	drm.async_page_flip = options->async_page_flip;
 
 	return &drm;
 }
