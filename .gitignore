@@ -1,2 +1,7 @@
 *.o
+*.so
 glsl
+
+__pycache__/
+.venv
+venv/
