@@ -114,7 +114,21 @@ optional arguments:
 > [!NOTE]
 > Python 3.10+ is required.
 
-You can try it with the shaders available in the `examples` directory, e.g.:
+You'll have to install the required dependencies once, e.g., with [venv](https://docs.python.org/3.10/library/venv.html):
+
+```shell
+$ python -m venv .venv
+$ source .venv/bin/activate
+$ pip install libevdev pillow
+```
+
+You may also want to be in the `input` group, so `/dev/input/eventX` devices can be open to handle [evdev](https://docs.kernel.org/input/input.html#evdev) events, without running as root, e.g.:
+
+```shell
+$ sudo adduser $USER input
+```
+
+You can then try it with the shaders available in the `examples` directory, e.g.:
 
 ```shell
 $ python glsl.py examples/plasma_globe.glsl -t iChannel0 presets/tex_RGBA_noise_medium.png
