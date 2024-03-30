@@ -108,6 +108,7 @@ struct options {
 	char mode[DRM_DISPLAY_MODE_LEN];
 	uint32_t format;
 	uint64_t modifier;
+	int connector;
 	bool async_page_flip;
 	bool atomic_drm_mode;
 	bool surfaceless;

@@ -23,6 +23,7 @@ class OPTIONS(Structure):
         ("mode",            c_ubyte * 32),
         ("format",          c_uint32),
         ("modifier",        c_uint64),
+        ("connector",       c_int),
         ("async_page_flip", c_bool),
         ("atomic_drm_mode", c_bool),
         ("surfaceless",     c_bool),
@@ -37,6 +38,10 @@ def options(args):
         c_opts.async_page_flip = c_bool(True)
     if args.atomic_drm_mode:
         c_opts.atomic_drm_mode = c_bool(True)
+    if args.connector:
+        c_opts.connector = c_int(args.connector)
+    else:
+        c_opts.connector = -1
     if args.device:
         c_opts.device = bytes(args.device.as_posix(), 'utf-8')
     if args.mode:

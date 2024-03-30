@@ -165,6 +165,37 @@ static int32_t find_crtc_for_connector(const struct drm *drm,
 	return -1;
 }
 
+static drmModeConnector *find_drm_connector(int fd, drmModeRes *resources,
+                                            int connector_id)
+{
+	drmModeConnector *connector = NULL;
+	int i;
+
+	if (connector_id >= 0) {
+		if (connector_id >= resources->count_connectors)
+			return NULL;
+
+		connector = drmModeGetConnector(fd, resources->connectors[connector_id]);
+		if (connector && connector->connection == DRM_MODE_CONNECTED)
+			return connector;
+
+		drmModeFreeConnector(connector);
+		return NULL;
+	}
+
+	for (i = 0; i < resources->count_connectors; i++) {
+		connector = drmModeGetConnector(fd, resources->connectors[i]);
+		if (connector && connector->connection == DRM_MODE_CONNECTED) {
+			/* it's connected, let's use this! */
+			break;
+		}
+		drmModeFreeConnector(connector);
+		connector = NULL;
+	}
+
+	return connector;
+}
+
 static int get_resources(int fd, drmModeRes **resources)
 {
 	*resources = drmModeGetResources(fd);
@@ -390,18 +421,9 @@ int init_drm(struct drm *drm, const int fd, const struct options *options)
 	}
 
 	/* find a connected connector: */
-	for (i = 0; i < resources->count_connectors; i++) {
-		connector = drmModeGetConnector(drm->fd, resources->connectors[i]);
-		if (connector->connection == DRM_MODE_CONNECTED) {
-			/* it's connected, let's use this! */
-			break;
-		}
-		drmModeFreeConnector(connector);
-		connector = NULL;
-	}
-
+	connector = find_drm_connector(drm->fd, resources, options->connector);
 	if (!connector) {
-		/* we could be fancy and listen for hotplug events and wait for
+		/* we could be fancy and listen for hot-plug events and wait for
 		 * a connector.
 		 */
 		printf("no connected connector!\n");

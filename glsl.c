@@ -39,40 +39,42 @@ static const struct egl *egl;
 static const struct gbm *gbm;
 static const struct drm *drm;
 
-static const char *shortopts = "aAc:D:f:hm:p:v:x";
+static const char *shortopts = "aAC:D:f:hm:n:p:v:x";
 
 static const struct option longopts[] = {
-		{"async",       no_argument,       0, 'a'},
-		{"atomic",      no_argument,       0, 'A'},
-		{"count",       required_argument, 0, 'c'},
-		{"device",      required_argument, 0, 'D'},
-		{"format",      required_argument, 0, 'f'},
-		{"help",        no_argument,       0, 'h'},
-		{"modifier",    required_argument, 0, 'm'},
-		{"perfcntr",    required_argument, 0, 'p'},
-		{"vmode",       required_argument, 0, 'v'},
-		{"surfaceless", no_argument,       0, 'x'},
-		{0,             0,                 0, 0}
+		{"async",        no_argument,       0, 'a'},
+		{"atomic",       no_argument,       0, 'A'},
+		{"connector",    required_argument, 0, 'C'},
+		{"device",       required_argument, 0, 'D'},
+		{"format",       required_argument, 0, 'f'},
+		{"help",         no_argument,       0, 'h'},
+		{"modifier",     required_argument, 0, 'm'},
+		{"frames",       required_argument, 0, 'n'},
+		{"perfcntr",     required_argument, 0, 'p'},
+		{"vmode",        required_argument, 0, 'v'},
+		{"surfaceless",  no_argument,       0, 'x'},
+		{0,              0,                 0, 0}
 };
 
 static void usage(const char *name) {
-	printf("Usage: %s [-aAcDfmpvx] <shader_file>\n"
-		   "\n"
-		   "options:\n"
-		   "    -a, --async              use async page flipping\n"
-		   "    -A, --atomic             use atomic mode setting and fencing\n"
-		   "    -c, --count              run for the specified number of frames\n"
-		   "    -D, --device=DEVICE      use the given device\n"
-		   "    -f, --format=FOURCC      framebuffer format\n"
-		   "    -h, --help               print usage\n"
-		   "    -m, --modifier=MODIFIER  hardcode the selected modifier\n"
-		   "    -p, --perfcntr=LIST      sample specified performance counters using\n"
-		   "                             the AMD_performance_monitor extension (comma\n"
-		   "                             separated list)\n"
-		   "    -v, --vmode=VMODE        specify the video mode in the format\n"
-		   "                             <mode>[-<vrefresh>]\n"
-		   "    -x, --surfaceless        use surfaceless mode, instead of GBM surface\n",
-		   name);
+	printf("Usage: %s [-aACDfmnpvx] <shader_file>\n"
+	       "\n"
+	       "options:\n"
+	       "    -a, --async              use async page flipping\n"
+	       "    -A, --atomic             use atomic mode setting and fencing\n"
+	       "    -C, --connector=ID       use the connector with the provided ID (see drm_info)\n"
+	       "    -D, --device=DEVICE      use the given device\n"
+	       "    -f, --format=FOURCC      framebuffer format\n"
+	       "    -h, --help               print usage\n"
+	       "    -m, --modifier=MODIFIER  hardcode the selected modifier\n"
+	       "    -n, --frames=N           run for the specified number of frames\n"
+	       "    -p, --perfcntr=LIST      sample specified performance counters using\n"
+	       "                             the AMD_performance_monitor extension (comma\n"
+	       "                             separated list)\n"
+	       "    -v, --vmode=VMODE        specify the video mode in the format\n"
+	       "                             <mode>[-<vrefresh>]\n"
+	       "    -x, --surfaceless        use surfaceless mode, instead of GBM surface\n",
+	       name);
 }
 
 int init(const char *shadertoy, const struct options *options) {
@@ -159,8 +161,9 @@ int main(int argc, char *argv[]) {
 	const char *perfcntr = NULL;
 
 	struct options options = {
-		.count = 0,
-		.mode = "",
+			.connector = -1,
+			.count = 0,
+			.mode = "",
 	};
 
 	int ret;
@@ -176,8 +179,8 @@ int main(int argc, char *argv[]) {
 			case 'A':
 				options.atomic_drm_mode = true;
 				break;
-			case 'c':
-				options.count = strtoul(optarg, NULL, 0);
+			case 'C':
+				options.connector = strtoul(optarg, NULL, 0);
 				break;
 			case 'D':
 				options.device = optarg;
@@ -201,6 +204,9 @@ int main(int argc, char *argv[]) {
 				return 0;
 			case 'm':
 				options.modifier = strtoull(optarg, NULL, 0);
+				break;
+			case 'n':
+				options.count = strtoul(optarg, NULL, 0);
 				break;
 			case 'p':
 				perfcntr = optarg;

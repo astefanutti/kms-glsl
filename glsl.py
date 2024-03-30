@@ -11,11 +11,6 @@ from lib import Metadata, options
 from input import *
 from libevdev import *
 
-# sudo usermod -a -G tty,input $USER
-# echo 'KERNEL=="uinput", MODE="0660", GROUP="input"' | sudo tee /etc/udev/rules.d/99-uinput.rules
-# sudo udevadm trigger
-# echo "uinput" | sudo tee /etc/modules-load.d/uinput.conf
-
 '''
 """
 Example #1:
@@ -132,6 +127,8 @@ parser.add_argument('--async-page-flip', action=argparse.BooleanOptionalAction,
                     help='use async page flipping')
 parser.add_argument('--atomic-drm-mode', action=argparse.BooleanOptionalAction,
                     help='use atomic mode setting and fencing')
+parser.add_argument('-C', '--connector', metavar='CONNECTOR', type=int,
+                    help='the DRM connector')
 parser.add_argument('-D', '--device', metavar='DEVICE', type=Path,
                     help='the DRM device')
 parser.add_argument('--mode', metavar='MODE', type=str,
