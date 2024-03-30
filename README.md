@@ -3,15 +3,15 @@
 KMS GLSL is a command line tool that runs OpenGL fragment shaders, using the [DRM/KMS Linux kernel subsystem](https://en.wikipedia.org/wiki/Direct_Rendering_Manager).
 It runs shaders fullscreen, and does not require any windowing system, like X or Wayland.
 
-It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi), using the VC4/V3D KMS driver, that supports OpenGL ES 3.1 (as of January 2023).
-However, it should work with any GPU and display controller hardware, provided a DRM/KMS driver is available.
-It has been successfully tested with the [Jetson Nano](https://ttt.io/glsl-jetson-nano), as well as the Raspberry Pi Zero.
+It has initially been developed to run shaders from [Shadertoy](https://www.shadertoy.com), on the [Raspberry Pi](https://ttt.io/glsl-raspberry-pi).
+However, it works with any GPU and display controller hardware, provided a DRM/KMS driver is available, like on the [Jetson Nano](https://ttt.io/glsl-jetson-nano).
+Examples of configuration, where it's been reported to run successfully on, are listed in the [compatibility](#compatibility) section.
 
-In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA (800×480) resolution:
+In the following picture, this [Shadertoy shader](https://www.shadertoy.com/view/MsX3Wj) runs on the Raspberry Pi 4, connected to the official Raspberry Pi 7" touchscreen monitor, in WVGA resolution:
 
 ![A Shadertoy shader running on the Raspberry Pi 4](./raspberry_pi.jpg)
 
-[Another shader](https://www.shadertoy.com/view/fstyD4) that runs on the Jetson Nano in full HD (1920×1080) resolution:
+[Another shader](https://www.shadertoy.com/view/fstyD4) that runs on the Jetson Nano in full HD resolution:
 
 ![A Shadertoy shader running on the Jetson Nano](./jetson_nano.jpg)
 
@@ -139,34 +139,18 @@ You can explore [shadertoy.com](https://www.shadertoy.com) to find additional sh
 
 If you want to add your own inputs, you can find the documentation and some examples in the `glsl.py` file.
 
-## Raspberry Pi
+## Compatibility
 
-Assuming you've installed [Raspberry Pi OS](https://www.raspberrypi.org/software/operating-systems), the DRM/KMS VC4/V3D driver can be configured by running the following commands:
+It's been reported to run successfully on the following configurations:
 
-1. Edit the [`/boot/config.txt`](https://www.raspberrypi.org/documentation/configuration/config-txt/) file, e.g.:
-
-    ```shell
-    $ sudo vi /boot/config.txt
-    ```
-
-2. Set the following properties:
-
-    ```properties
-    # Required: Enable the DRM/KMS VC4 V3D driver
-    dtoverlay=vc4-kms-v3d
-    # Optional: Increase the memory reserved for the GPU
-    gpu_mem=128
-    ```
-
-3. Reboot your Raspberry Pi, so that the changes are taken into account, e.g.:
-
-    ```shell
-    $ sudo reboot
-    ```
-
-Note this also works with the Raspberry Pi OS Lite versions, as it does not need any compositor like X, Wayland or similar.
-
-It has successfully been tested on the RPi 4, running the Raspberry Pi OS 2023-09-22, Linux kernel 5.15.
+| Hardware                                    | OS / Kernel                                | Driver                  | Date    |
+|---------------------------------------------|--------------------------------------------|-------------------------|---------|
+| NVIDIA GeForce RTX 3060                     | Ubuntu 23.10, Linux 6.5                    | NVIDIA Driver 545.29.06 | 03/2024 |
+| Jetson Orin NX                              | Jetson Linux 35.3.1, Linux 5.10            | NVIDIA DRM Driver       | 09/2023 |
+| Jetson Nano (Tegra X1)                      | Jetson Linux 32.7.4, Linux 4.6             | Mesa NVIDIA Tegra       | 06/2023 |
+| Raspberry Pi 4 (Broadcom VideoCore VI)      | Raspberry Pi OS 2023-02, Linux 5.15        | Mesa VC4 V3D 19.3.2     | 09/2023 |
+| Raspberry Pi Zero W (Broadcom VideoCore IV) | Raspberry Pi OS 2022-09, Linux 5.15        | Mesa VC4 V3D 19.3.2     | 05/2023 |
+| Raspberry Pi 3B+ (Broadcom VideoCore IV)    | Raspberry Pi OS Lite 2020-12, Linux 5.4.79 | Mesa VC4 V3D 19.3.2     | 08/2021 |
 
 ## Roadmap
 
