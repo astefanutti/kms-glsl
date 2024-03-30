@@ -39,16 +39,17 @@ Once you've successfully built the binary / library, you can either run it direc
 
 ```console
 $ ./glsl -h
-Usage: ./glsl [-aAcDfmpvx] <shader_file>
+Usage: ./glsl [-aACDfmnpvx] <shader_file>
 
 options:
     -a, --async              use async page flipping
     -A, --atomic             use atomic mode setting and fencing
-    -c, --count              run for the specified number of frames
+    -C, --connector=ID       use the connector with the provided ID (see drm_info)
     -D, --device=DEVICE      use the given device
     -f, --format=FOURCC      framebuffer format
     -h, --help               print usage
     -m, --modifier=MODIFIER  hardcode the selected modifier
+    -n, --frames=N           run for the specified number of frames
     -p, --perfcntr=LIST      sample specified performance counters using
                              the AMD_performance_monitor extension (comma
                              separated list)
@@ -78,9 +79,10 @@ You can use the Python wrapper, that adds a layer around the native library for 
 ```console
 $ python glsl.py -h
 usage: glsl.py [-h] [--async-page-flip | --no-async-page-flip]
-               [--atomic-drm-mode | --no-atomic-drm-mode] [-D DEVICE] [--mode MODE]
-               [-k UNIFORM] [--touch UNIFORM] [-c UNIFORM FILE] [-t UNIFORM FILE]
-               [-v UNIFORM FILE] [-m <UNIFORM>.KEY VALUE]
+               [--atomic-drm-mode | --no-atomic-drm-mode] [-C CONNECTOR]
+               [-D DEVICE] [--mode MODE] [-k UNIFORM] [--touch UNIFORM]
+               [-c UNIFORM FILE] [-t UNIFORM FILE] [-v UNIFORM FILE]
+               [-m <UNIFORM>.KEY VALUE]
                FILE
 
 Run OpenGL shaders using DRM/KMS
@@ -88,12 +90,14 @@ Run OpenGL shaders using DRM/KMS
 positional arguments:
   FILE                  the shader file
 
-optional arguments:
+options:
   -h, --help            show this help message and exit
   --async-page-flip, --no-async-page-flip
                         use async page flipping
   --atomic-drm-mode, --no-atomic-drm-mode
                         use atomic mode setting and fencing
+  -C CONNECTOR, --connector CONNECTOR
+                        the DRM connector
   -D DEVICE, --device DEVICE
                         the DRM device
   --mode MODE           specify the video mode in the format
