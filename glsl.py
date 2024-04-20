@@ -169,8 +169,10 @@ with ExitStack() as stack:
         elif args.keyboard and dev.has(EV_KEY) and dev.has(EV_KEY.KEY_A):
             # Keyboard
             Keyboard(args.keyboard, dev)
-        elif dev.has(EV_ABS) and dev.has(EV_KEY.BTN_TOUCH):
+        elif dev.has(EV_ABS) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_DIRECT):
             # Touchscreen
+            # Only consider direct input devices, like touchscreens and drawing tablets, see:
+            # https://www.kernel.org/doc/Documentation/input/event-codes.txt
             Touchscreen(args.touch if args.touch else 'iTouch', dev)
         else:
             dev.fd.close()
