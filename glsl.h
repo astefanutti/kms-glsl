@@ -28,6 +28,8 @@
 
 extern int init(const char *shadertoy, const struct options *options);
 extern int run();
+extern int join();
+extern void stop();
 
 extern void onInit(void callback(uint program, uint width, uint height));
 extern void onRender(void callback(uint64_t frame, float time));
