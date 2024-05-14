@@ -257,10 +257,18 @@ void *thread_run() {
 	return (void *) drm->run(gbm, egl);
 }
 
-int run() {
-	pthread_t thread;
+volatile pthread_t thread;
 
+int run() {
 	eglMakeCurrent(egl->display, EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
 
 	return pthread_create(&thread, NULL, thread_run, NULL);
+}
+
+int join() {
+    return pthread_join(thread, NULL);
+}
+
+void stop() {
+    pthread_cancel(thread);
 }

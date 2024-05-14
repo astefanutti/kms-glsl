@@ -1,15 +1,18 @@
 #!/usr/bin/env python
 
 import argparse
-from contextlib import ExitStack
 import glob
 import os
+import signal
 import stat
-from threading import Event
+import threading
 
+from contextlib import ExitStack
 from lib import Metadata, options
 from input import *
 from libevdev import *
+from signal import pthread_sigmask, pthread_kill, sigwait
+from threading import main_thread
 
 '''
 """
@@ -203,10 +206,21 @@ if ret != 0:
     close_devices()
     exit(ret)
 
-signal = Event()
-try:
-    signal.wait()
-except KeyboardInterrupt:
-    pass
-finally:
-    close_devices()
+
+stopped = threading.Event()
+pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCONT])
+
+
+def join():
+    glsl.join()
+    stopped.set()
+    pthread_kill(main_thread().ident, signal.SIGCONT)
+
+
+Thread(target=join).start()
+
+if sigwait({signal.SIGINT, signal.SIGCONT}) == signal.SIGINT:
+    glsl.stop()
+    stopped.wait(timeout=30)
+
+close_devices()
