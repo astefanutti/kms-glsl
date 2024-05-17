@@ -135,8 +135,10 @@ parser.add_argument('--mode', metavar='MODE', type=str,
                     help='specify the video mode in the format <resolution>[-<vrefresh>]')
 parser.add_argument('-k', '--keyboard', metavar='UNIFORM', type=str,
                     help='add keyboard')
-parser.add_argument('--touch', metavar='UNIFORM', type=str,
-                    help='add touch device')
+parser.add_argument('--touchscreen', metavar='UNIFORM', type=str,
+                    help='add touchscreen device')
+parser.add_argument('--trackpad', metavar='UNIFORM', type=str,
+                    help='add trackpad device')
 parser.add_argument('-c', '--cubemap', metavar=('UNIFORM', 'FILE'), type=str, nargs=2,
                     action='append', dest='cubemaps', default=[], help='add cubemap')
 parser.add_argument('-t', '--texture', metavar=('UNIFORM', 'FILE'), type=str, nargs=2,
@@ -173,7 +175,10 @@ with ExitStack() as stack:
             # Touchscreen
             # Only consider direct input devices, like touchscreens and drawing tablets, see:
             # https://www.kernel.org/doc/Documentation/input/event-codes.txt
-            Touchscreen(args.touch if args.touch else 'iTouch', dev)
+            Touchscreen(args.touchscreen if args.touchcreen else 'iTouchscreen', dev)
+        elif dev.has(EV_ABS) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):
+            # https://www.kernel.org/doc/Documentation/input/multi-touch-protocol.txt
+            Trackpad(args.trackpad if args.trackpad else 'iTrackpad', dev)
         else:
             dev.fd.close()
             continue
@@ -184,8 +189,11 @@ with ExitStack() as stack:
 if args.keyboard and len(list(filter(lambda i: isinstance(i, Keyboard), inputs))) == 0:
     print(f'no keyboard device found for uniform {args.keyboard}')
 
-if args.touch and len(list(filter(lambda i: isinstance(i, Touchscreen), inputs))) == 0:
-    print(f'no touch device found for uniform {args.touch}')
+if args.touchscreen and len(list(filter(lambda i: isinstance(i, Touchscreen), inputs))) == 0:
+    print(f'no touchscreen device found for uniform {args.touchscreen}')
+
+if args.trackpad and len(list(filter(lambda i: isinstance(i, Trackpad), inputs))) == 0:
+    print(f'no trackpad device found for uniform {args.trackpad}')
 
 for cubemap in args.cubemaps:
     CubemapTexture(cubemap[0], cubemap[1])

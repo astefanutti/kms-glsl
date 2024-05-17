@@ -46,6 +46,15 @@ def _setup(program, width, height):
             inputs.remove(touchscreen)
             TouchMouse('iMouse', touchscreen.dev)
 
+    trackpads = list(filter(lambda i: isinstance(i, Trackpad), inputs))
+    for trackpad in trackpads:
+        try:
+            trackpad.init(program=program, width=width, height=height)
+        except NoActiveUniformVariable:
+            # Fall back to using the trackpad as a mouse device
+            inputs.remove(trackpad)
+            TrackMouse('iMouse', trackpad.dev)
+
     # Multiplex all mouse devices into a single input
     mice = list(filter(lambda i: isinstance(i, Mouse) and i.name == 'iMouse', inputs))
     if len(mice) > 1:
@@ -65,10 +74,10 @@ def _setup(program, width, height):
             invalids.append((input, exception))
 
     for input in invalids:
-        if input[0].name == 'iMouse':
+        if input[0].name == 'iMouse' and isinstance(input[1], NoActiveUniformVariable):
             # iMouse uniform is always added, but is removed by the compiler if unused
             continue
-        print(f"invalid input '{input[0].name}': {input[1]}")
+        print(f"invalid {type(input[0]).__name__} input '{input[0].name}': {input[1]}")
 
     # Start each evdev device event handler in a separate thread
     for input in valids:
@@ -396,25 +405,25 @@ class MultiMouse(Input):
                 self.active = None
 
 
+class _MTSlot:
+    touch = False
+    drag = (False, False)
+    drag_xy = drag_start = (1, 1)
+
+
 class Touchscreen(InputDevice):
-    # touch = False
-    slots = []
-    u4fv = None
     dev_abs_max = None
     resolution: (int, int) = None
-
-    class _Slot:
-        touch = False
-        drag = (False, False)
-        drag_xy = drag_start = (1, 1)
+    slots = []
+    u4fv = None
 
     def init(self, width, height, **kwargs):
         super().init(width=width, height=height, **kwargs)
 
-        self.slots = [self._Slot() for _ in range(self.dev.num_slots)]
-        self.u4fv = [0.0] * self.dev.num_slots * 4
         self.dev_abs_max = (self.dev.absinfo[EV_ABS.ABS_X].maximum, self.dev.absinfo[EV_ABS.ABS_Y].maximum)
         self.resolution = (width, height)
+        self.slots = [_MTSlot() for _ in range(self.dev.num_slots)]
+        self.u4fv = [0.0] * self.dev.num_slots * 4
 
     def handler(self, ev, **_):
         slot = self.slots[self.dev.current_slot]
@@ -422,7 +431,6 @@ class Touchscreen(InputDevice):
             if ev.value >= 0:
                 slot.touch = True
             else:
-                # slot.touch = False
                 slot.drag = (False, False)
         elif ev.code == EV_ABS.ABS_MT_POSITION_X:
             slot.drag_xy = (ev.value / self.dev_abs_max[0] * self.resolution[0], slot.drag_xy[1])
@@ -459,8 +467,8 @@ class TouchMouse(Mouse):
     drag_xy = drag_start = (1, 1)
     touch = False
 
-    def init(self, width, height, **kwargs):
-        super().init(width=width, height=height, **kwargs)
+    def init(self, **kwargs):
+        super().init(**kwargs)
 
         self.dev_abs_max = (self.dev.absinfo[EV_ABS.ABS_X].maximum, self.dev.absinfo[EV_ABS.ABS_Y].maximum)
 
@@ -479,6 +487,110 @@ class TouchMouse(Mouse):
                 self._drag = (True, self._drag[1])
         elif ev.code == EV_ABS.ABS_Y:
             self.drag_xy = (self.drag_xy[0], self.resolution[1] - ev.value / self.dev_abs_max[1] * self.resolution[1])
+            if not self._drag[1]:
+                self.drag_start = (self.drag_start[0], self.drag_xy[1])
+                self._drag = (self._drag[0], True)
+
+    def render(self, **_):
+        (z, w) = self.drag_start
+        if self.drag:
+            if not self.touch:
+                (z, w) = (z, -w)
+        else:
+            (z, w) = (-z, -w)
+
+        glsl.glUniform4f(self.loc, c_float(self.drag_xy[0]), c_float(self.drag_xy[1]), c_float(z), c_float(w))
+
+        if self.touch:
+            self.touch = False
+
+
+class Trackpad(InputDevice):
+    dev_abs_x: (int, int) = None
+    dev_abs_y: (int, int) = None
+    resolution: (int, int) = None
+    slots = []
+    u4fv = None
+
+    def init(self, width, height, **kwargs):
+        super().init(width=width, height=height, **kwargs)
+
+        self.dev_abs_x = (self.dev.absinfo[EV_ABS.ABS_X].minimum, self.dev.absinfo[EV_ABS.ABS_X].maximum)
+        self.dev_abs_y = (self.dev.absinfo[EV_ABS.ABS_Y].minimum, self.dev.absinfo[EV_ABS.ABS_Y].maximum)
+        self.resolution = (width, height)
+        self.slots = [_MTSlot() for _ in range(self.dev.num_slots)]
+        self.u4fv = [0.0] * self.dev.num_slots * 4
+
+    def handler(self, ev, **_):
+        slot = self.slots[self.dev.current_slot]
+        if ev.code == EV_ABS.ABS_MT_TRACKING_ID:
+            if ev.value >= 0:
+                slot.touch = True
+            else:
+                slot.drag = (False, False)
+        elif ev.code == EV_ABS.ABS_MT_POSITION_X:
+            slot.drag_xy = ((ev.value - self.dev_abs_x[0]) /
+                            (self.dev_abs_x[1] - self.dev_abs_x[0]) * self.resolution[0], slot.drag_xy[1])
+            if not slot.drag[0]:
+                slot.drag_start = (slot.drag_xy[0], slot.drag_start[1])
+                slot.drag = (True, slot.drag[1])
+        elif ev.code == EV_ABS.ABS_MT_POSITION_Y:
+            slot.drag_xy = (slot.drag_xy[0], self.resolution[1] - (ev.value - self.dev_abs_y[0]) /
+                            (self.dev_abs_y[1] - self.dev_abs_y[0]) * self.resolution[1])
+            if not slot.drag[1]:
+                slot.drag_start = (slot.drag_start[0], slot.drag_xy[1])
+                slot.drag = (slot.drag[0], True)
+
+    def render(self, **_):
+        for i, slot in enumerate(self.slots):
+            self.u4fv[4 * i] = slot.drag_xy[0]
+            self.u4fv[4 * i + 1] = slot.drag_xy[1]
+            (z, w) = slot.drag_start
+            if slot.drag[0] and slot.drag[1]:
+                if not slot.touch:
+                    (z, w) = (z, -w)
+            else:
+                (z, w) = (-z, -w)
+            self.u4fv[4 * i + 2] = z
+            self.u4fv[4 * i + 3] = w
+            if slot.touch:
+                slot.touch = False
+
+        glsl.glUniform4fv(self.loc, len(self.u4fv), (c_float * len(self.u4fv))(*self.u4fv))
+
+
+class TrackMouse(Mouse):
+    dev_abs_x: (int, int) = None
+    dev_abs_y: (int, int) = None
+    resolution: (int, int) = None
+    _drag = (False, False)
+    drag_xy = drag_start = (1, 1)
+    touch = False
+
+    def init(self, width, height, **kwargs):
+        super().init(width=width, height=height, **kwargs)
+
+        self.dev_abs_x = (self.dev.absinfo[EV_ABS.ABS_X].minimum, self.dev.absinfo[EV_ABS.ABS_X].maximum)
+        self.dev_abs_y = (self.dev.absinfo[EV_ABS.ABS_Y].minimum, self.dev.absinfo[EV_ABS.ABS_Y].maximum)
+        self.resolution = (width, height)
+
+    def handler(self, ev, **_):
+        if ev.code == EV_KEY.BTN_TOUCH:
+            if ev.value == 1:
+                self.drag = True
+                self.touch = True
+            else:
+                self.drag = False
+                self._drag = (False, False)
+        elif ev.code == EV_ABS.ABS_X:
+            self.drag_xy = ((ev.value - self.dev_abs_x[0]) /
+                            (self.dev_abs_x[1] - self.dev_abs_x[0]) * self.resolution[0], self.drag_xy[1])
+            if not self._drag[0]:
+                self.drag_start = (self.drag_xy[0], self.drag_start[1])
+                self._drag = (True, self._drag[1])
+        elif ev.code == EV_ABS.ABS_Y:
+            self.drag_xy = (self.drag_xy[0], self.resolution[1] - (ev.value - self.dev_abs_y[0]) /
+                            (self.dev_abs_y[1] - self.dev_abs_y[0]) * self.resolution[1])
             if not self._drag[1]:
                 self.drag_start = (self.drag_start[0], self.drag_xy[1])
                 self._drag = (self._drag[0], True)
