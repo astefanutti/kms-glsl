@@ -168,7 +168,7 @@ static int atomic_run(const struct gbm *gbm, const struct egl *egl)
 
 	start_time = report_time = get_time_ns();
 
-	while (drm.count == 0 || i < drm.count) {
+	while (drm.frames == 0 || i < drm.frames) {
 		unsigned frame = i;
 		struct gbm_bo *next_bo;
 

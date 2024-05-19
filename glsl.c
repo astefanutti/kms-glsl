@@ -67,7 +67,7 @@ static void usage(const char *name) {
 	       "    -f, --format=FOURCC      framebuffer format\n"
 	       "    -h, --help               print usage\n"
 	       "    -m, --modifier=MODIFIER  hardcode the selected modifier\n"
-	       "    -n, --frames=N           run for the specified number of frames\n"
+	       "    -n, --frames=N           run for the given number of frames and exit\n"
 	       "    -p, --perfcntr=LIST      sample specified performance counters using\n"
 	       "                             the AMD_performance_monitor extension (comma\n"
 	       "                             separated list)\n"
@@ -162,7 +162,7 @@ int main(int argc, char *argv[]) {
 
 	struct options options = {
 			.connector = -1,
-			.count = 0,
+			.frames = 0,
 			.mode = "",
 	};
 
@@ -206,7 +206,7 @@ int main(int argc, char *argv[]) {
 				options.modifier = strtoull(optarg, NULL, 0);
 				break;
 			case 'n':
-				options.count = strtoul(optarg, NULL, 0);
+				options.frames = strtoul(optarg, NULL, 0);
 				break;
 			case 'p':
 				perfcntr = optarg;

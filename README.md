@@ -49,7 +49,7 @@ options:
     -f, --format=FOURCC      framebuffer format
     -h, --help               print usage
     -m, --modifier=MODIFIER  hardcode the selected modifier
-    -n, --frames=N           run for the specified number of frames
+    -n, --frames=N           run for the given number of frames and exit
     -p, --perfcntr=LIST      sample specified performance counters using
                              the AMD_performance_monitor extension (comma
                              separated list)
@@ -80,9 +80,9 @@ You can use the Python wrapper, that adds a layer around the native library for 
 $ python glsl.py -h
 usage: glsl.py [-h] [--async-page-flip | --no-async-page-flip]
                [--atomic-drm-mode | --no-atomic-drm-mode] [-C CONNECTOR]
-               [-D DEVICE] [--mode MODE] [-k UNIFORM] [--touch UNIFORM]
-               [-c UNIFORM FILE] [-t UNIFORM FILE] [-v UNIFORM FILE]
-               [-m <UNIFORM>.KEY VALUE]
+               [-D DEVICE] [--mode MODE] [-n N] [-k UNIFORM]
+               [--touchscreen UNIFORM] [--trackpad UNIFORM] [-c UNIFORM FILE]
+               [-t UNIFORM FILE] [-v UNIFORM FILE] [-m <UNIFORM>.KEY VALUE]
                FILE
 
 Run OpenGL shaders using DRM/KMS
@@ -102,9 +102,12 @@ options:
                         the DRM device
   --mode MODE           specify the video mode in the format
                         <resolution>[-<vrefresh>]
+  -n N, --frames N      run for the given number of frames and exit
   -k UNIFORM, --keyboard UNIFORM
                         add keyboard
-  --touch UNIFORM       add touch device
+  --touchscreen UNIFORM
+                        add touchscreen device
+  --trackpad UNIFORM    add trackpad device
   -c UNIFORM FILE, --cubemap UNIFORM FILE
                         add cubemap
   -t UNIFORM FILE, --texture UNIFORM FILE

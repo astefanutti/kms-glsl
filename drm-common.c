@@ -412,7 +412,7 @@ int init_drm(struct drm *drm, const int fd, const struct options *options)
 
 	drm->fd = fd;
 	drm->async_page_flip = options->async_page_flip;
-	drm->count = options->count;
+	drm->frames = options->frames;
 
 	get_resources(drm->fd, &resources);
 	if (!resources) {

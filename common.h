@@ -113,7 +113,7 @@ struct options {
 	bool atomic_drm_mode;
 	bool surfaceless;
 	unsigned int vrefresh;
-	unsigned int count;
+	unsigned int frames;
 };
 
 struct gbm {
