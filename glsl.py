@@ -136,6 +136,8 @@ parser.add_argument('-D', '--device', metavar='DEVICE', type=Path,
                     help='the DRM device')
 parser.add_argument('--mode', metavar='MODE', type=str,
                     help='specify the video mode in the format <resolution>[-<vrefresh>]')
+parser.add_argument('-n', '--frames', metavar='N', type=int,
+                    help='run for the given number of frames and exit')
 parser.add_argument('-k', '--keyboard', metavar='UNIFORM', type=str,
                     help='add keyboard')
 parser.add_argument('--touchscreen', metavar='UNIFORM', type=str,

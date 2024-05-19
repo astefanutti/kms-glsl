@@ -28,7 +28,7 @@ class OPTIONS(Structure):
         ("atomic_drm_mode", c_bool),
         ("surfaceless",     c_bool),
         ("vrefresh",        c_int),
-        ("count",           c_int),
+        ("frames",          c_uint),
     ]
 
 
@@ -46,4 +46,6 @@ def options(args):
         c_opts.device = bytes(args.device.as_posix(), 'utf-8')
     if args.mode:
         c_opts.mode = (c_ubyte * 32)(*bytes(args.mode, 'utf-8'))
+    if args.frames:
+        c_opts.frames = c_uint(args.frames)
     return c_opts

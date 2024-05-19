@@ -64,7 +64,7 @@ struct drm {
 	bool async_page_flip;
 
 	/* number of frames to run for: */
-	unsigned int count;
+	unsigned int frames;
 
 	int (*run)(const struct gbm *gbm, const struct egl *egl);
 };
