@@ -2,14 +2,14 @@
 
 import argparse
 import glob
+import re
 import os
-import signal
 import stat
-import threading
 
 from contextlib import ExitStack
-from lib import Metadata, options
+from inotify import INotify, IN_CREATE, IN_ATTRIB
 from input import *
+from lib import options
 from libevdev import *
 from signal import pthread_sigmask, pthread_kill, sigwait
 from threading import main_thread
@@ -123,6 +123,19 @@ glsl.onInit(init)
 glsl.onRender(render)
 '''
 
+
+class Metadata(argparse.Action):
+
+    def __call__(self, _, namespace, values, option=None):
+        m = re.search(r'^(\w+)\.(\w+)$', values[0])
+        if not m:
+            raise ValueError(f'value {values[0]} for option {option} must match <UNIFORM>.KEY')
+        metadata = getattr(namespace, self.dest)
+        if not m.group(1) in metadata:
+            metadata[m.group(1)] = {}
+        metadata[m.group(1)] = {**metadata[m.group(1)], **{m.group(2): values[1]}}
+
+
 parser = argparse.ArgumentParser(description='Run OpenGL shaders using DRM/KMS')
 parser.add_argument('shader', metavar='FILE', type=Path, nargs=1,
                     help='the shader file')
@@ -154,68 +167,68 @@ parser.add_argument('-m', '--metadata', metavar=('<UNIFORM>.KEY', 'VALUE'), type
                     action=Metadata, dest='metadata', default={}, help='set uniform metadata')
 args = parser.parse_args()
 
-
-def is_device(input_dev):
-    if not os.path.exists(input_dev):
-        return False
-
-    m = os.stat(input_dev)[stat.ST_MODE]
-    if not stat.S_ISCHR(m):
-        return False
-
-    return True
+for (uniform, path) in args.cubemaps:
+    CubemapTexture(uniform, path)
+for (uniform, path) in args.textures:
+    ImageTexture(uniform, path, **args.metadata[uniform] if uniform in args.metadata else {})
+for (uniform, path) in args.volumes:
+    VolumeTexture(uniform, path)
 
 
-close_devices = None
-with ExitStack() as stack:
-    for path in list(filter(is_device, glob.glob('{}/event*'.format('/dev/input')))):
-        dev = Device(stack.enter_context(open(path, 'rb')))
-        if dev.has(EV_REL) and dev.has(EV_KEY.BTN_LEFT):
-            # Mouse
-            ButtonMouse('iMouse', dev)
-        elif args.keyboard and dev.has(EV_KEY) and dev.has(EV_KEY.KEY_A):
-            # Keyboard
-            Keyboard(args.keyboard, dev)
-        elif dev.has(EV_ABS) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_DIRECT):
-            # Touchscreen
-            # Only consider direct input devices, like touchscreens and drawing tablets, see:
-            # https://www.kernel.org/doc/Documentation/input/event-codes.txt
-            Touchscreen(args.touchscreen if args.touchcreen else 'iTouchscreen', dev)
-        elif dev.has(EV_ABS) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):
-            # https://www.kernel.org/doc/Documentation/input/multi-touch-protocol.txt
-            Trackpad(args.trackpad if args.trackpad else 'iTrackpad', dev)
-        else:
-            dev.fd.close()
-            continue
-        dev.grab()
+def input_from_device(dev: Device):
+    if dev.has(EV_REL) and dev.has(EV_KEY.BTN_LEFT):
+        # Mouse
+        ButtonMouse('iMouse', dev)
+    elif dev.has(EV_KEY) and dev.has(EV_KEY.KEY_A):
+        # Keyboard
+        Keyboard(args.keyboard if args.keyboard else 'iKeyboard', dev)
+    elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_DIRECT):
+        # Touchscreen
+        # Only consider direct input devices, like touchscreens and drawing tablets, see:
+        # https://www.kernel.org/doc/Documentation/input/event-codes.txt
+        Touchscreen(args.touchscreen if args.touchscreen else 'iTouchscreen', dev)
+    elif dev.has(EV_ABS.ABS_MT_SLOT) and dev.has(EV_KEY.BTN_TOUCH) and dev.has_property(INPUT_PROP_POINTER):
+        # Trackpad
+        # https://www.kernel.org/doc/Documentation/input/multi-touch-protocol.txt
+        Trackpad(args.trackpad if args.trackpad else 'iTrackpad', dev)
+    else:
+        dev.fd.close()
 
-    close_devices = stack.pop_all().close
 
-if args.keyboard and len(list(filter(lambda i: isinstance(i, Keyboard), inputs))) == 0:
-    print(f'no keyboard device found for uniform {args.keyboard}')
+devices = ExitStack()
+with devices:
+    for path in list(filter(lambda p: os.path.exists(p) and stat.S_ISCHR(os.stat(p)[stat.ST_MODE]),
+                            glob.glob('{}/event*'.format('/dev/input')))):
+        input_from_device(Device(devices.enter_context(open(path, 'rb'))))
+    devices = devices.pop_all()
 
-if args.touchscreen and len(list(filter(lambda i: isinstance(i, Touchscreen), inputs))) == 0:
-    print(f'no touchscreen device found for uniform {args.touchscreen}')
+inotify = INotify()
+inotify.add_watch('/dev/input', IN_CREATE | IN_ATTRIB)
 
-if args.trackpad and len(list(filter(lambda i: isinstance(i, Trackpad), inputs))) == 0:
-    print(f'no trackpad device found for uniform {args.trackpad}')
 
-for cubemap in args.cubemaps:
-    CubemapTexture(cubemap[0], cubemap[1])
-for texture in args.textures:
-    ImageTexture(texture[0], texture[1], **args.metadata[texture[0]] if texture[0] in args.metadata else {})
-for volume in args.volumes:
-    VolumeTexture(volume[0], volume[1])
+def hot_plug_devices():
+    with devices:
+        while True:
+            for ev in inotify.read():
+                p = os.path.join('/dev/input', ev.name)
+                if (str.startswith(ev.name, 'event')
+                        and os.path.exists(p)
+                        and os.access(p, os.R_OK)
+                        and stat.S_ISCHR(os.stat(p)[stat.ST_MODE])):
+                    input_from_device(Device(devices.enter_context(open(p, 'rb'))))
+
+
+Thread(target=hot_plug_devices, daemon=True).start()
 
 ret = glsl.init(bytes(args.shader[0].as_posix(), 'utf-8'), byref(options(args)))
 if ret != 0:
-    close_devices()
-    exit(ret)
-ret = glsl.run()
-if ret != 0:
-    close_devices()
+    devices.close()
     exit(ret)
 
+ret = glsl.run()
+if ret != 0:
+    devices.close()
+    exit(ret)
 
 stopped = threading.Event()
 pthread_sigmask(signal.SIG_BLOCK, [signal.SIGCONT])
@@ -227,10 +240,11 @@ def join():
     pthread_kill(main_thread().ident, signal.SIGCONT)
 
 
-Thread(target=join).start()
+Thread(target=join, daemon=True).start()
 
 if sigwait({signal.SIGINT, signal.SIGCONT}) == signal.SIGINT:
     glsl.stop()
     stopped.wait(timeout=30)
 
-close_devices()
+inotify.close()
+devices.close()

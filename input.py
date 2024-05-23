@@ -1,6 +1,11 @@
 from ctypes import *
-from typing import Optional
+from typing import Generic, Optional, TypeVar
 
+import collections
+import signal
+import threading
+
+from errno import ENODEV
 from gl import *
 from libevdev import EV_ABS, EV_KEY, EV_REL, EventsDroppedException
 from pathlib import Path
@@ -8,7 +13,8 @@ from PIL import Image
 from lib import glsl
 from threading import Thread
 
-inputs = []
+_pending_inputs = collections.deque()
+_active_inputs = []
 _texture_units = iter([])
 
 
@@ -20,80 +26,130 @@ def _init_slots():
     _texture_units = iter([i for i in range(value if value > 0 else 16)])
 
 
-def _evdev_event(d, handler, **kwargs):
+def _input_devices():
+    for input in _active_inputs:
+        if isinstance(input, MultiInput):
+            for i in input.inputs:
+                if isinstance(i, InputDevice):
+                    yield i
+        elif isinstance(input, InputDevice):
+            yield input
+
+
+def _evdev_event(input):
+    try:
+        while True:
+            try:
+                for ev in input.dev.events():
+                    input.handler.event(ev, target=input)
+            except EventsDroppedException:
+                for ev in input.dev.sync():
+                    input.handler.event(ev, target=input)
+    except IOError as e:
+        if e.errno == ENODEV:
+            print(f'input device {input.dev.name} unplugged')
+        else:
+            print(f'error reading events from input device {input.dev.name}', e)
+    except Exception as e:
+        print(f'error reading events from input device {input.dev.name}', e)
+    finally:
+        ClosingDevice(input)
+
+
+def _validate_input(input, program, width, height):
+    # Remove the input if its device has closed
+    if isinstance(input, ClosingDevice):
+        if (isinstance(input.target, Mouse)
+                and (multi := next(filter(lambda i: isinstance(i, MultiMouse), _active_inputs), None))):
+            multi.remove(input.target)
+            if len(multi.mice) == 1:
+                mouse = multi.mice[0]
+                multi.remove(mouse)
+                _active_inputs.append(mouse)
+                _active_inputs.remove(multi)
+        else:
+            _active_inputs.remove(input.target)
+        return
+
+    # Check if it's an input device that's already open
+    if (isinstance(input, InputDevice)
+            and next(filter(lambda i: i.dev.fd.name == input.dev.fd.name, _input_devices()), None)):
+        return
+
+    # Hacky way to append the synthetic input at the end of the queue, so it's popped right next
+    def _push_right(f): i = f(); _pending_inputs.rotate(-1); return i
+
+    # Check the input refers to an existing uniform
+    try:
+        input.init(program=program, width=width, height=height)
+    except NoActiveUniformVariable as e:
+        if isinstance(input, Mouse) and input.name != 'iMouse':
+            print(f"invalid {type(input).__name__} input '{input.name}': {e}")
+        elif isinstance(input, Touchscreen):
+            # TODO: keep the touchscreen device that's the same as the display device
+            # Fall back to using the touchscreen as a mouse device
+            _push_right(lambda: TouchMouse('iMouse', input.dev))
+        elif isinstance(input, Trackpad):
+            # Fall back to using the trackpad as a mouse device
+            _push_right(lambda: TrackMouse('iMouse', input.dev))
+        return
+    except Exception as e:
+        print(f"invalid {type(input).__name__} input '{input.name}': {e}")
+        return
+
+    # Handle the input multiplexing
+    if isinstance(input, Mouse):
+        # Multiplex mouse devices into a single input
+        # TODO: multiplex by uniform name
+        if multi := next(filter(lambda i: isinstance(i, MultiMouse), _active_inputs), None):
+            multi.add(input)
+        elif mouse := next(filter(lambda i: isinstance(i, Mouse), _active_inputs), None):
+            _active_inputs.remove(mouse)
+            _push_right(lambda: MultiMouse('iMouse')).add(mouse, input)
+        else:
+            _active_inputs.append(input)
+    else:
+        _active_inputs.append(input)
+
+    # Start processing events from the input device
+    if isinstance(input, InputDevice):
+        input.dev.grab()
+        Thread(target=_evdev_event, args=[input], daemon=True).start()
+
+
+def _drain(q: collections.deque):
     while True:
         try:
-            for ev in d.events():
-                handler(ev, **kwargs)
-        except EventsDroppedException:
-            for ev in d.sync():
-                handler(ev, **kwargs)
+            yield q.pop()
+        except IndexError:
+            break
 
 
 @CFUNCTYPE(None, c_uint, c_uint, c_uint)
 def _setup(program, width, height):
-    global inputs
     _init_slots()
 
-    touchscreens = list(filter(lambda i: isinstance(i, Touchscreen), inputs))
-    if len(touchscreens) > 0:
-        # TODO: keep the touchscreen device that's the same as the display device
-        touchscreen = touchscreens[0]
-        try:
-            touchscreen.init(program=program, width=width, height=height)
-        except NoActiveUniformVariable:
-            # Fall back to using the touchscreen as a mouse device
-            inputs.remove(touchscreen)
-            TouchMouse('iMouse', touchscreen.dev)
-
-    trackpads = list(filter(lambda i: isinstance(i, Trackpad), inputs))
-    for trackpad in trackpads:
-        try:
-            trackpad.init(program=program, width=width, height=height)
-        except NoActiveUniformVariable:
-            # Fall back to using the trackpad as a mouse device
-            inputs.remove(trackpad)
-            TrackMouse('iMouse', trackpad.dev)
-
-    # Multiplex all mouse devices into a single input
-    mice = list(filter(lambda i: isinstance(i, Mouse) and i.name == 'iMouse', inputs))
-    if len(mice) > 1:
-        multi = MultiMouse('iMouse')
-        for mouse in mice:
-            inputs.remove(mouse)
-            multi.mice.append(mouse)
-
-    # Check inputs and remove invalid ones
-    valids, invalids = [], []
-
-    for input in inputs:
-        try:
-            input.init(program=program, width=width, height=height)
-            valids.append(input)
-        except Exception as exception:
-            invalids.append((input, exception))
-
-    for input in invalids:
-        if input[0].name == 'iMouse' and isinstance(input[1], NoActiveUniformVariable):
-            # iMouse uniform is always added, but is removed by the compiler if unused
-            continue
-        print(f"invalid {type(input[0]).__name__} input '{input[0].name}': {input[1]}")
-
-    # Start each evdev device event handler in a separate thread
-    for input in valids:
-        if isinstance(input, InputDevice):
-            Thread(target=_evdev_event, args=(input.device, input.handler), daemon=True).start()
-        if isinstance(input, MultiMouse):
-            for mouse in input.mice:
-                Thread(target=_evdev_event, args=(mouse.device, input.handler),
-                       kwargs={'target': mouse}, daemon=True).start()
-
-    inputs = valids
+    # Drain all the inputs defined during initialisation
+    for input in _drain(_pending_inputs):
+        _validate_input(input, program, width, height)
 
 
 @CFUNCTYPE(None, c_uint64, c_float)
 def _update(frame, time):
-    for input in inputs:
+    # Drain pending inputs (added at runtime)
+    if len(_pending_inputs):
+        program = c_uint()
+        glsl.glGetIntegerv(GL_CURRENT_PROGRAM, pointer(program))
+
+        viewport = (c_uint*4)()
+        glsl.glGetIntegerv(GL_VIEWPORT, viewport)
+        (width, height) = viewport[2:4]
+
+        for input in _drain(_pending_inputs):
+            _validate_input(input, program, width, height)
+
+    # Render active inputs
+    for input in _active_inputs:
         input.render(frame=frame, time=time)
 
 
@@ -115,7 +171,7 @@ class Input:
 
     def __init__(self, name):
         self.name = name
-        inputs.append(self)
+        _pending_inputs.appendleft(self)
 
     def init(self, program, width, height):
         self.loc = glsl.glGetUniformLocation(program, bytes(self.name, 'utf-8'))
@@ -234,19 +290,36 @@ class CubemapTexture(Texture):
         image.close()
 
 
-class InputDevice(Input):
+class EventHandler:
+
+    def event(self, ev, target, **__):
+        raise NotImplementedError
+
+
+class InputDevice(Input, EventHandler):
     dev = None
+    handler = None
 
     def __init__(self, name, dev):
         super().__init__(name)
         self.dev = dev
+        self.handler = self
 
     @property
     def device(self):
         return self.dev
 
-    def handler(self, ev, **_):
-        raise NotImplementedError
+
+class ClosingDevice(InputDevice):
+    target: InputDevice = None
+
+    def __init__(self, target):
+        super().__init__(target.name, target.dev)
+        self.target = target
+
+    @property
+    def device(self):
+        return self.target.dev
 
 
 keycodes = {
@@ -310,7 +383,7 @@ keycodes = {
 class Keyboard(InputDevice, Texture):
     buffer = [0] * 256 * 3
 
-    def handler(self, ev, **_):
+    def event(self, ev, **_):
         if not ev.matches(EV_KEY):
             return
         code = -1
@@ -327,7 +400,12 @@ class Keyboard(InputDevice, Texture):
             self.buffer[256 + code] = 255
             self.buffer[256 * 2 + code] = 255 - self.buffer[256 * 2 + code]
 
-    def render(self, **_):
+            # The keyboard device has been grabbed, so events are not sent to virtual
+            # devices. The main thread has to be interrupted on CTRL+C explicitly.
+            if ev.matches(EV_KEY.KEY_C) and self.buffer[17]:
+                signal.pthread_kill(threading.main_thread().ident, signal.SIGINT)
+
+    def render(self, frame, **_):
         glsl.glActiveTexture(GL_TEXTURE0 + self.unit)
         glsl.glBindTexture(GL_TEXTURE_2D, self.tex)
         glsl.glTexImage2D(GL_TEXTURE_2D, 0, GL_R8, 256, 3, 0, GL_RED, GL_UNSIGNED_BYTE,
@@ -351,7 +429,7 @@ class ButtonMouse(Mouse):
     click = False
     pointer_xy = drag_start = drag_xy = (1, 1)
 
-    def handler(self, ev, **_):
+    def event(self, ev, **_):
         if ev.matches(EV_KEY):
             if not ev.code == EV_KEY.BTN_LEFT:
                 return
@@ -383,9 +461,20 @@ class ButtonMouse(Mouse):
             self.click = False
 
 
-class MultiMouse(Input):
-    mice: [Mouse] = []
+# TODO: rely on implicit Generic class once Python 3.12+ becomes a requirement
+T = TypeVar('T')
+
+
+class MultiInput(Generic[T], Input):
+    inputs: [T] = []
+
+
+class MultiMouse(MultiInput[Mouse], EventHandler):
     active: Optional[Mouse] = None
+
+    @property
+    def mice(self):
+        return self.inputs
 
     def init(self, **kwargs):
         super().init(**kwargs)
@@ -393,8 +482,18 @@ class MultiMouse(Input):
         for mouse in self.mice:
             mouse.init(**kwargs)
 
-    def handler(self, ev, target, **kwargs):
-        target.handler(ev, **kwargs)
+    def add(self, *mice: [Mouse]):
+        for mouse in mice:
+            mouse.handler = self
+            self.mice.append(mouse)
+
+    def remove(self, *mice: [Mouse]):
+        for mouse in mice:
+            self.mice.remove(mouse)
+            mouse.handler = mouse
+
+    def event(self, ev, target, **kwargs):
+        target.event(ev, **kwargs)
         if self.active is None and target.drag:
             self.active = target
 
@@ -416,6 +515,7 @@ class Touchscreen(InputDevice):
     resolution: (int, int) = None
     slots = []
     u4fv = None
+    dirty = False
 
     def init(self, width, height, **kwargs):
         super().init(width=width, height=height, **kwargs)
@@ -425,7 +525,8 @@ class Touchscreen(InputDevice):
         self.slots = [_MTSlot() for _ in range(self.dev.num_slots)]
         self.u4fv = [0.0] * self.dev.num_slots * 4
 
-    def handler(self, ev, **_):
+    def event(self, ev, **_):
+        self.dirty = True
         slot = self.slots[self.dev.current_slot]
         if ev.code == EV_ABS.ABS_MT_TRACKING_ID:
             if ev.value >= 0:
@@ -444,6 +545,12 @@ class Touchscreen(InputDevice):
                 slot.drag = (slot.drag[0], True)
 
     def render(self, **_):
+        if not self.dirty:
+            return
+
+        dirty = self.dirty
+        self.dirty = False
+
         for i, slot in enumerate(self.slots):
             self.u4fv[4 * i] = slot.drag_xy[0]
             self.u4fv[4 * i + 1] = slot.drag_xy[1]
@@ -457,8 +564,10 @@ class Touchscreen(InputDevice):
             self.u4fv[4 * i + 3] = w
             if slot.touch:
                 slot.touch = False
+                self.dirty = True
 
-        glsl.glUniform4fv(self.loc, len(self.u4fv), (c_float * len(self.u4fv))(*self.u4fv))
+        if dirty:
+            glsl.glUniform4fv(self.loc, len(self.u4fv), (c_float * len(self.u4fv))(*self.u4fv))
 
 
 class TouchMouse(Mouse):
@@ -472,7 +581,7 @@ class TouchMouse(Mouse):
 
         self.dev_abs_max = (self.dev.absinfo[EV_ABS.ABS_X].maximum, self.dev.absinfo[EV_ABS.ABS_Y].maximum)
 
-    def handler(self, ev, **_):
+    def event(self, ev, **_):
         if ev.code == EV_KEY.BTN_TOUCH:
             if ev.value == 1:
                 self.drag = True
@@ -511,6 +620,7 @@ class Trackpad(InputDevice):
     resolution: (int, int) = None
     slots = []
     u4fv = None
+    dirty = False
 
     def init(self, width, height, **kwargs):
         super().init(width=width, height=height, **kwargs)
@@ -521,7 +631,8 @@ class Trackpad(InputDevice):
         self.slots = [_MTSlot() for _ in range(self.dev.num_slots)]
         self.u4fv = [0.0] * self.dev.num_slots * 4
 
-    def handler(self, ev, **_):
+    def event(self, ev, **_):
+        self.dirty = True
         slot = self.slots[self.dev.current_slot]
         if ev.code == EV_ABS.ABS_MT_TRACKING_ID:
             if ev.value >= 0:
@@ -542,6 +653,12 @@ class Trackpad(InputDevice):
                 slot.drag = (slot.drag[0], True)
 
     def render(self, **_):
+        if not self.dirty:
+            return
+
+        dirty = self.dirty
+        self.dirty = False
+
         for i, slot in enumerate(self.slots):
             self.u4fv[4 * i] = slot.drag_xy[0]
             self.u4fv[4 * i + 1] = slot.drag_xy[1]
@@ -555,8 +672,10 @@ class Trackpad(InputDevice):
             self.u4fv[4 * i + 3] = w
             if slot.touch:
                 slot.touch = False
+                self.dirty = True
 
-        glsl.glUniform4fv(self.loc, len(self.u4fv), (c_float * len(self.u4fv))(*self.u4fv))
+        if dirty:
+            glsl.glUniform4fv(self.loc, len(self.u4fv), (c_float * len(self.u4fv))(*self.u4fv))
 
 
 class TrackMouse(Mouse):
@@ -574,7 +693,7 @@ class TrackMouse(Mouse):
         self.dev_abs_y = (self.dev.absinfo[EV_ABS.ABS_Y].minimum, self.dev.absinfo[EV_ABS.ABS_Y].maximum)
         self.resolution = (width, height)
 
-    def handler(self, ev, **_):
+    def event(self, ev, **_):
         if ev.code == EV_KEY.BTN_TOUCH:
             if ev.value == 1:
                 self.drag = True
