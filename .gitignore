@@ -51,3 +51,10 @@ venv.bak/
 #  and can be added to the global gitignore or merged into this file. However, if you prefer,
 #  you could uncomment the following to ignore the entire vscode folder
 .vscode/
+
+# local artifacts (cloth interaction testing)
+*.orig
+*.mov
+*.mp4
+record*.json
+.claude/
