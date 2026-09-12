@@ -484,6 +484,7 @@ grabBrakeOnset = float(os.environ.get("GRAB_BRAKE_ONSET", "12"))
 # sweep found crossings, a grab is active), every UNCROSS_DRAG_EVERY frames.
 uncrossDrag = int(os.environ.get("UNCROSS_DRAG", "1") not in ("0", "", "false"))
 uncrossDragEvery = int(os.environ.get("UNCROSS_DRAG_EVERY", "2"))
+uncrossDragFull = int(os.environ.get("UNCROSS_DRAG_FULL", "0") not in ("0", "", "false"))
 # Staged-patch self-crossing veto (see _patch_self_crossed): valley-plow
 # attribution showed the dominant in-drag crossing bursts are the patch RIM
 # crossing itself/its skirt (memE1-2 x memF1-3, all ring<=2) -- the per-frame
@@ -785,8 +786,33 @@ uncrossStepMax = float(os.environ.get("UNCROSS_STEP_MAX", "2.0")) * d_offset
 # saved settled wads burst=3-with-dilation was within noise of burst=1
 # (f44 vs f39 to zero on the 714 state, equal elsewhere), so the burst's
 # value is the fresh-release regime, not settled cores.
-uncrossBurstN = int(os.environ.get("UNCROSS_BURST_N", "100"))
+# 2026-09: lowered 100 -> 30 with the contour resolver -- the released-patch
+# self-fold tail (30-100 pairs, no island, legacy vote) drains ~3x faster with
+# the settle-interleaved passes engaged (wad_300: 27 -> 6 frames to zero).
+uncrossBurstN = int(os.environ.get("UNCROSS_BURST_N", "30"))
+# Burst rounds stay at 3 with the contour resolver: each round advances the
+# rigid island moves, so rounds within a pass DO buy drain here (wad_1500:
+# resolver-visible zero by ~f10 with 3 vs still 15 pairs at f24 with 1) --
+# the legacy vote's "burst rounds buy no drain and amplify cascades" finding
+# does not carry over. Cost is bounded by the frame budget below instead.
 uncrossBurstIters = int(os.environ.get("UNCROSS_BURST_ITERS", "3"))
+# Per-frame resolver wall budget: once a frame's rounds have consumed it,
+# the remaining burst rounds / interleaved passes of that frame are skipped
+# (the substeps still run in full; a frame's first sweep always runs). The
+# budget scales with the wad the frame's first sweep found -- min(cap,
+# max(floor, per_pair x pairs)) -- so the hitch a frame may spend on
+# recovery follows the visible damage. At 400^2 a round costs ~9 ms host-
+# visible + ~2.5 ms of extra substep work (the flips densify the contacts),
+# and the rounds of a big wad are no cheaper than those of a mid one (the
+# sweep dominates), so unbudgeted 15-round frames were ~270 ms on the 1500-
+# pair fixture and ~190 ms on the 800-pair one. Measured with the defaults
+# (400^2 release fixtures, 3 reps): wad_1500 max 181-188 ms, resolver-
+# visible zero in 14-15 frames (unbudgeted: 10-15 frames at ~285 ms);
+# wad_800 max 130-133 ms, zero in 15-24 frames; wad_300 ~80 ms, 6-9 frames.
+# UNCROSS_BUDGET_MS=0 disables the budget.
+uncrossBudgetMs = float(os.environ.get("UNCROSS_BUDGET_MS", "120"))          # cap
+uncrossBudgetPerPair = float(os.environ.get("UNCROSS_BUDGET_PER_PAIR_MS", "0.1"))
+uncrossBudgetMin = float(os.environ.get("UNCROSS_BUDGET_MIN_MS", "50"))      # floor
 # Regional flip dilation: diffuse each flip vector into the flipped vertex's
 # same-sheet grid neighborhood (uncrossDilate rings of the 4-neighborhood,
 # decayed by uncrossDilateGain per ring, veto-tested like the flips
@@ -867,10 +893,68 @@ uncrossMaskR = float(os.environ.get("UNCROSS_MASK_R", "0.25"))
 # "pair" = independent per-pair least-motion (can pick incoherent directions
 # along a band).
 uncrossVote = os.environ.get("UNCROSS_VOTE", "cluster")
-# Vectorized no-new-crossing veto (see _resolve_crossings / _veto_flips_vec);
-# UNCROSS_VETO_CHECK=1 cross-checks it against the reference loop every round.
-uncrossVetoVec = int(os.environ.get("UNCROSS_VETO_VEC", "1") not in ("0", "", "false"))
+# CONTOUR-COHERENT flipping (2026-09, kills the resolver cascade). Every
+# sheet-sheet intersection contour shows up as TWO union-find clusters:
+# A-edges x B-faces (vertices on sheet A) and B-edges x A-faces (vertices on
+# sheet B). The legacy vote flipped BOTH clusters in the same round, each
+# across the other's faces, so the two sheets jumped THROUGH each other
+# simultaneously and the pair set re-formed (measured on the mid-plow
+# wad_300 fixture: per round created ~= removed, ~100% of the created pairs
+# had flipped vertices on BOTH the edge and the face, clusters=2 paired=2
+# both_flipped=2 every round) -- that is the 300 -> 3500 cascade. With
+# UNCROSS_CONTOUR=1 the paired clusters are grouped per contour and only ONE
+# sheet flips per group per round: the sheet whose crossing edges CUT OFF a
+# finite island of its own grid (the poked-through tongue -- found by a local
+# flood fill of the grid with the crossing edges removed) flips its island-
+# side contour vertices; if both sheets have an island, the smaller one; if
+# neither (open contour on both / detection gap), the cheaper legacy vote.
+# UNCROSS_ISLAND_BODY=1 additionally moves the island INTERIOR along with its
+# contour ring (mean ring flip vector, capped) so the tongue retracts bodily
+# instead of ring-by-ring (replaces the grid dilation for that cluster).
+uncrossContour = int(os.environ.get("UNCROSS_CONTOUR", "1") not in ("0", "", "false"))
+uncrossIslandBody = int(os.environ.get("UNCROSS_ISLAND_BODY", "1") not in ("0", "", "false"))
+uncrossIslandMax = int(os.environ.get("UNCROSS_ISLAND_MAX", "20000"))  # bodily-move cap (vertices)
+uncrossCoherence = float(os.environ.get("UNCROSS_COHERENCE", "0.3"))    # min outer-ring flip coherence
+uncrossIslandRigid = int(os.environ.get("UNCROSS_ISLAND_RIGID", "1") not in ("0", "", "false"))
+uncrossIslandMinStep = float(os.environ.get("UNCROSS_ISLAND_MIN_STEP", "0.33")) * d_offset
+uncrossIslandToiPct = float(os.environ.get("UNCROSS_ISLAND_TOI_PCT", "2"))   # percentile of first-hit
+# No-new-crossing veto (see _resolve_crossings): UNCROSS_VETO_GPU=1 runs the
+# veto_flips kernel over the round's hash grid (default), 0 the numpy host
+# reference _veto_flips_vec (same allowed-set policy, same exact test);
+# UNCROSS_VETO_CHECK=1 runs both every round and asserts they agree.
+uncrossVetoGpu = int(os.environ.get("UNCROSS_VETO_GPU", "1") not in ("0", "", "false"))
 uncrossVetoCheck = int(os.environ.get("UNCROSS_VETO_CHECK", "0") not in ("0", "", "false"))
+# Two-tier crossing sweep (UNCROSS_SWEEP_L1, metres): the per-edge grid walk
+# needs radius half-edge + L where L bounds the longest edge of any face it
+# must find. One stretched edge used to force L to edgeLenCap (0.06 -> 7^3
+# cells per edge in a pile, 8-12 ms per sweep at 400^2). Now tier 1 walks
+# half + min(L1, longest capped edge) and finds every face whose longest edge
+# <= that, and tier 2 (detect_crossings_big, one thread per face with longest
+# edge in (L1, edgeLenCap], typically a few thousand) walks from the face
+# centroid for edges instead. Same guarantee set as before (faces with an
+# edge > edgeLenCap stay opportunistic), identical pair sets on the fixtures.
+# UNCROSS_SWEEP_L1 >= edgeLenCap restores the single-tier sweep.
+uncrossSweepL1 = float(os.environ.get("UNCROSS_SWEEP_L1", "0.03"))
+maxBigFaces = 65536               # tier-2 face list capacity per sweep
+# NOTE (warp 1.13 HashGrid + CUDA graphs): the resolver's sweep rebuilds the
+# SIM's hash grid object at the SIM's cell width (gridCellSize) -- it must
+# not build any other wp.HashGrid, nor this one at another width, between
+# graph replays. warp's hash_grid_update_device_impl uploads the device
+# descriptor from a `static HashGrid_t grid` host variable so that the
+# memcpy can be recorded in a graph; the captured sim build therefore
+# re-copies whatever that static holds at REPLAY time. A second grid (or a
+# different cell width) leaves the other descriptor / width in the static,
+# the replayed sim grid is corrupted and the broadphase goes blind
+# (measured: a 400^2 drape self-intersected within 22 frames with a
+# separate 0.04 m resolver grid; the substeps ran in ~22 ms with a 0.04 m
+# rebuild of the sim grid). A 0.04 m cell would have made the sweep ~15%
+# cheaper (3.6 -> 3.1 ms); not available under this constraint.
+# UNCROSS_PROF=1: per-stage wall timers of the resolver (sweep / recs / plan.*
+# / dilate / veto / apply ...), accumulated per frame in Cloth._uncrossProf
+# and printed by simulate(). Adds a device sync before each sweep so GPU work
+# is attributed to the stage that waits for it (the substep chunk otherwise
+# lands in "sweep"). A bench may also set Cloth._uncrossProf = {} itself.
+_UNCROSS_PROF = os.environ.get("UNCROSS_PROF", "") not in ("", "0")
 
 # Self-collision is split into a hash-grid "detect" pass that caches candidate
 # primitives and a query-free "narrowphase" pass that does the segment-segment /
@@ -1192,6 +1276,13 @@ class Cloth(Input):
                 self.hostTriIds[i, 1] = id2
                 self.hostTriIds[i, 2] = id3
                 i += 1
+        # (the crossing resolver's island patches rely on this layout: the
+        # tris 2*(xi*num_y + yi), +1 belong to grid cell (xi, yi) -- see
+        # Cloth._patch_faces)
+        _cell = np.arange(num_x * num_y, dtype=np.int64)
+        _id0 = (_cell // num_y) * (num_y + 1) + _cell % num_y
+        assert np.array_equal(self.hostTriIds[0::2, 0], _id0) \
+            and np.array_equal(self.hostTriIds[1::2, 2], _id0 + 1), "grid tri layout"
 
         self.prevPos = wp.array(pos, dtype=wp.vec3)
         self.restPos = wp.clone(self.prevPos)
@@ -1449,6 +1540,27 @@ class Cloth(Input):
         self.crossPairs = wp.zeros((maxCross, 2), dtype=wp.int32)
         self.crossCount = wp.zeros(1, dtype=wp.int32)
         self.crossBounds = wp.zeros(1, dtype=float)
+        # crossing-resolver scratch (see _resolve_crossings): device veto
+        # arrays + pinned host mirrors for the per-round readbacks/uploads
+        # (~0.2 ms for the 400^2 positions instead of pageable copies); the
+        # flip staging is grown on demand, outside any graph capture (the
+        # resolver runs between replays)
+        self.vetoIds = None
+        self._ensure_veto_capacity(4096)
+        self.faceGroup = wp.zeros(self.numTris, dtype=wp.uint64)
+        self.pinFaceGroup = wp.zeros(self.numTris, dtype=wp.uint64, device="cpu", pinned=True)
+        self.pinPos = wp.zeros(self.numParticles, dtype=wp.vec3, device="cpu", pinned=True)
+        self.pinPairs = wp.zeros((maxCross, 2), dtype=wp.int32, device="cpu", pinned=True)
+        self.flipOf = wp.full(self.numParticles, -1, dtype=wp.int32)
+        # side stream for the sweep/veto tier-2 kernels (a few thousand
+        # threads: they hide under the tier-1 walk instead of serializing
+        # behind it); the resolver runs outside any graph capture
+        self.sideStream = wp.Stream()
+        # two-tier crossing sweep scratch (see _sweep_crossings)
+        self.crossReach = wp.zeros(self.numParticles, dtype=float)
+        self.crossFaceLongest = wp.zeros(self.numTris, dtype=float)
+        self.bigFaceIds = wp.zeros(maxBigFaces, dtype=wp.int32)
+        self.bigFaceCount = wp.zeros(1, dtype=wp.int32)
         self.hostEdgeIds = edge_arr
         self.hostVertFaceOff = vf_off
         self.hostVertFaceIds = self.vertFaceIds.numpy()
@@ -1783,6 +1895,52 @@ class Cloth(Input):
         for e in range(t, num, boundsReduceThreads):
             m = wp.max(m, wp.length(prev_pos[edge_ids[e, 1]] - prev_pos[edge_ids[e, 0]]))
         wp.atomic_max(bounds, 0, m)
+
+    @staticmethod
+    @wp.kernel
+    def max_capped_edge_length(
+            pos: wp.array(dtype=wp.vec3),
+            edge_ids: wp.array2d(dtype=wp.int32),
+            bounds: wp.array(dtype=float)):   # out: bounds[0] = longest edge <= edgeLenCap
+        # Crossing-sweep bound: the longest CURRENT edge among edges no longer
+        # than edgeLenCap. The sweep's guarantee ("a face is found if its
+        # longest edge <= bound") is unchanged versus min(longest, cap) --
+        # every face with all edges <= cap has its longest edge <= this max --
+        # but a single stretched edge (e.g. 0.2 at a released grab) no longer
+        # forces the walk radius to the cap: the wad_1500 fixture drops from
+        # r = half + 0.06 to half + ~0.03 (7^3 -> 5^3 cells per edge).
+        t = wp.tid()
+        num = edge_ids.shape[0]
+        m = float(0.0)
+        for e in range(t, num, boundsReduceThreads):
+            l = wp.length(pos[edge_ids[e, 1]] - pos[edge_ids[e, 0]])
+            if l <= edgeLenCap:
+                m = wp.max(m, l)
+        wp.atomic_max(bounds, 0, m)
+
+    @staticmethod
+    @wp.kernel
+    def vertex_reach(
+            pos: wp.array(dtype=wp.vec3),
+            tri_ids: wp.array2d(dtype=wp.int32),
+            vert_face_off: wp.array(dtype=wp.int32),
+            vert_face_ids: wp.array(dtype=wp.int32),
+            reach: wp.array(dtype=float)):    # out: longest edge of any incident face
+        # Per-vertex crossing reach for the sweep/veto walks: a face incident
+        # to u can contain a segment-crossing point q only if |q - u| <= the
+        # face's longest edge <= reach[u], so a walk candidate u farther than
+        # (half segment + reach[u]) from the segment midpoint cannot own a
+        # crossed face and its incident-face loop is skipped (exact prune).
+        u = wp.tid()
+        m = float(0.0)
+        for k in range(vert_face_off[u], vert_face_off[u + 1]):
+            f = vert_face_ids[k]
+            p0 = pos[tri_ids[f, 0]]
+            p1 = pos[tri_ids[f, 1]]
+            p2 = pos[tri_ids[f, 2]]
+            m = wp.max(m, wp.max(wp.length(p1 - p0),
+                                 wp.max(wp.length(p2 - p1), wp.length(p0 - p2))))
+        reach[u] = m
 
     @staticmethod
     @wp.func
@@ -3586,22 +3744,32 @@ class Cloth(Input):
             grid_rc: wp.array2d(dtype=wp.int32),
             vert_face_off: wp.array(dtype=wp.int32),
             vert_face_ids: wp.array(dtype=wp.int32),
-            bounds: wp.array(dtype=float),         # [0] = longest current edge
+            bounds: wp.array(dtype=float),         # [0] = longest current edge (capped max)
+            reach: wp.array(dtype=float),          # per-vertex incident-face longest edge
+            face_longest: wp.array(dtype=float),   # per-face longest current edge
+            l1: float,                             # tier-1 bound (see uncrossSweepL1)
             pairs: wp.array2d(dtype=wp.int32),     # out: crossed (edge, face)
             count: wp.array(dtype=wp.int32)):      # out: atomic append counter
-        # Crossing-resolver DETECTION (once per frame, outside the graph): exact
-        # segment-triangle intersections on the CURRENT geometry. A face
-        # intersected by this edge has its intersection point q within half the
-        # edge length of the edge midpoint, and some face vertex within the
-        # longest-edge bound L of q, so a grid walk of half + L from the
-        # midpoint reaches a vertex of every intersected face. Each face is
-        # tested once: only the minimum-id face vertex IN RANGE expands it.
-        # Faces sharing a vertex with the edge are skipped (adjacent geometry
+        # Crossing-resolver DETECTION (outside the graph): exact segment-
+        # triangle intersections on the CURRENT geometry, TIER 1 of the two-
+        # tier sweep (see uncrossSweepL1). A face intersected by this edge has
+        # its intersection point q within half the edge length of the edge
+        # midpoint, and EVERY face vertex within the face's longest edge <= L
+        # of q, so a grid walk of half + L from the midpoint reaches all
+        # three vertices of every intersected tier-1 face; each face is
+        # tested once: only its minimum-id vertex IN RANGE expands it. Faces
+        # sharing a vertex with the edge are skipped (adjacent geometry
         # cannot legitimately "cross" its own edge), and so are 2-ring
         # material neighbors (see the ring-cull note below -- those belong to
         # SOLVER_RING prevention, not to flipping). Oversized (stretch-wad)
-        # primitives are skipped; the resolver targets settled/locked states,
-        # not mid-wad transients.
+        # edges are skipped; faces with a longest edge in (L, edgeLenCap]
+        # belong to detect_crossings_big, faces beyond edgeLenCap are
+        # opportunistic. (Measured dead ends at 400^2: a vertex-parallel
+        # variant walking once per vertex for its <= 3 owned edges was 2.3x
+        # SLOWER -- the inner face loops, not the walks, dominate in the
+        # dense pile; an exact incremental re-sweep of only the primitives
+        # touching the previous round's flips saved 6% per round -- the
+        # flipped region IS the dense pile.)
         e = wp.tid()
         va = edge_ids[e, 0]
         vb = edge_ids[e, 1]
@@ -3611,16 +3779,22 @@ class Cloth(Input):
         half = 0.5 * wp.length(d)
         if not (half < 0.5 * edgeLenCap):  # oversized or NaN edge: skip
             return
-        L = wp.min(bounds[0], edgeLenCap)
+        L = wp.min(bounds[0], l1)
         mid = 0.5 * (pa + pb)
         r = half + L + 1.0e-4
         query = wp.hash_grid_query(grid, mid, r)
         u = wp.int32(0)
         while wp.hash_grid_query_next(query, u):
-            if wp.length(pos[u] - mid) > r:
+            du = wp.length(pos[u] - mid)
+            if du > r:
                 continue
+            if du > half + reach[u] + 1.0e-4:
+                continue  # no incident face can reach a crossing point (exact)
             for k in range(vert_face_off[u], vert_face_off[u + 1]):
                 f = vert_face_ids[k]
+                fl = face_longest[f]
+                if fl > L and fl <= edgeLenCap:
+                    continue  # tier-2 face (detect_crossings_big owns it)
                 i0 = tri_ids[f, 0]
                 i1 = tri_ids[f, 1]
                 i2 = tri_ids[f, 2]
@@ -3676,6 +3850,299 @@ class Cloth(Input):
                 if idx < maxCross:
                     pairs[idx, 0] = e
                     pairs[idx, 1] = f
+
+    @staticmethod
+    @wp.kernel
+    def collect_big_faces(
+            face_longest: wp.array(dtype=float),
+            bounds: wp.array(dtype=float),
+            l1: float,
+            big: wp.array(dtype=wp.int32),
+            count: wp.array(dtype=wp.int32)):
+        # Tier-2 face list for the crossing sweep: faces whose longest current
+        # edge lies in (tier-1 bound, edgeLenCap].
+        f = wp.tid()
+        fl = face_longest[f]
+        if fl > wp.min(bounds[0], l1) and fl <= edgeLenCap:
+            idx = wp.atomic_add(count, 0, 1)
+            if idx < maxBigFaces:
+                big[idx] = f
+
+    @staticmethod
+    @wp.kernel
+    def detect_crossings_big(
+            grid: wp.uint64,
+            pos: wp.array(dtype=wp.vec3),
+            edge_ids: wp.array2d(dtype=wp.int32),
+            tri_ids: wp.array2d(dtype=wp.int32),
+            grid_rc: wp.array2d(dtype=wp.int32),
+            vert_edge_off: wp.array(dtype=wp.int32),
+            vert_edge_ids: wp.array(dtype=wp.int32),
+            reach: wp.array(dtype=float),          # per-vertex incident-face longest edge
+            big: wp.array(dtype=wp.int32),
+            big_count: wp.array(dtype=wp.int32),
+            pairs: wp.array2d(dtype=wp.int32),
+            count: wp.array(dtype=wp.int32)):
+        # Tier-2 crossing sweep, FACE-centric (see uncrossSweepL1): for each
+        # face with a longest edge in (L1, edgeLenCap], walk the grid from its
+        # centroid for the endpoints of edges that may cross it. A crossing
+        # point q lies within the face's centroid radius R, and a non-
+        # oversized edge through q has its NEARER endpoint within half its
+        # length (<= edgeLenCap/2) of q, so radius R + edgeLenCap/2 reaches
+        # that endpoint of every such edge. Each edge is tested once, by its
+        # endpoint nearer to the centroid (ties by id), with the same culls
+        # as tier 1. Exact per-vertex prune: every incident edge of u lies in
+        # an incident face, so it is at most reach[u] long and u is the
+        # nearer endpoint of a crossing edge only within R + reach[u]/2 of
+        # the centroid.
+        b = wp.tid()
+        if b >= wp.min(big_count[0], maxBigFaces):
+            return
+        f = big[b]
+        i0 = tri_ids[f, 0]
+        i1 = tri_ids[f, 1]
+        i2 = tri_ids[f, 2]
+        a0 = pos[i0]
+        a1 = pos[i1]
+        a2 = pos[i2]
+        c = (a0 + a1 + a2) / 3.0
+        R = wp.max(wp.length(a0 - c), wp.max(wp.length(a1 - c), wp.length(a2 - c)))
+        r = R + 0.5 * edgeLenCap + 1.0e-4
+        e1 = a1 - a0
+        e2 = a2 - a0
+        query = wp.hash_grid_query(grid, c, r)
+        u = wp.int32(0)
+        while wp.hash_grid_query_next(query, u):
+            du = wp.length(pos[u] - c)
+            if du > r:
+                continue
+            if du > R + 0.5 * reach[u] + 1.0e-4:
+                continue  # no incident edge can reach the face (exact)
+            for k in range(vert_edge_off[u], vert_edge_off[u + 1]):
+                e = vert_edge_ids[k]
+                va = edge_ids[e, 0]
+                vb = edge_ids[e, 1]
+                if va == i0 or va == i1 or va == i2 \
+                        or vb == i0 or vb == i1 or vb == i2:
+                    continue  # shares a vertex with the face
+                o = vb
+                if u == vb:
+                    o = va
+                # dedup: the endpoint nearer to the centroid expands the edge
+                do = wp.length(pos[o] - c)
+                if do < du or (do == du and o < u):
+                    continue
+                pa = pos[va]
+                pb = pos[vb]
+                d = pb - pa
+                half = 0.5 * wp.length(d)
+                if not (half < 0.5 * edgeLenCap):
+                    continue  # oversized or NaN edge
+                if (Cloth.within_ring_rc(grid_rc, va, i0)
+                        or Cloth.within_ring_rc(grid_rc, va, i1)
+                        or Cloth.within_ring_rc(grid_rc, va, i2)
+                        or Cloth.within_ring_rc(grid_rc, vb, i0)
+                        or Cloth.within_ring_rc(grid_rc, vb, i1)
+                        or Cloth.within_ring_rc(grid_rc, vb, i2)):
+                    continue
+                h = wp.cross(d, e2)
+                det = wp.dot(e1, h)
+                if wp.abs(det) < 1.0e-14:
+                    continue
+                inv = 1.0 / det
+                sv = pa - a0
+                bu = wp.dot(sv, h) * inv
+                if bu < 0.0 or bu > 1.0:
+                    continue
+                q = wp.cross(sv, e1)
+                bv = wp.dot(d, q) * inv
+                if bv < 0.0 or bu + bv > 1.0:
+                    continue
+                t = wp.dot(e2, q) * inv
+                if t <= 0.0 or t >= 1.0:
+                    continue
+                idx = wp.atomic_add(count, 0, 1)
+                if idx < maxCross:
+                    pairs[idx, 0] = e
+                    pairs[idx, 1] = f
+
+    @staticmethod
+    @wp.kernel
+    def veto_flips(
+            grid: wp.uint64,                       # hash grid on CURRENT pos (the sweep's)
+            pos: wp.array(dtype=wp.vec3),
+            ids: wp.array(dtype=wp.int32),         # moving vertices
+            disp: wp.array(dtype=wp.vec3),         # their (capped) displacements
+            flip_group: wp.array(dtype=wp.uint64), # allowed-set bits per flip
+            face_group: wp.array(dtype=wp.uint64), # allowed-set bits per face
+            tri_ids: wp.array2d(dtype=wp.int32),
+            vert_face_off: wp.array(dtype=wp.int32),
+            vert_face_ids: wp.array(dtype=wp.int32),
+            bounds: wp.array(dtype=float),         # [0] = longest current edge (capped max)
+            reach: wp.array(dtype=float),          # per-vertex incident-face longest edge
+            face_longest: wp.array(dtype=float),   # per-face longest current edge
+            l1: float,                             # tier-1 bound (see uncrossSweepL1)
+            tmin: wp.array(dtype=float)):          # in/out: first foreign hit (pre-filled 1)
+        # Crossing-resolver NO-NEW-CROSSING VETO on device (see
+        # _resolve_crossings; host reference _veto_flips_vec, same policy):
+        # exact Moller-Trumbore of each flip segment [p, p + d] against every
+        # nearby face that is neither the flip vertex's own nor in its
+        # allowed set (face_group & flip_group != 0: its contour's partner
+        # surface / the intended partner sheet's patch). Same two-tier walk
+        # as the sweep: a face intersected by the segment has a vertex within
+        # its longest edge of the intersection point, which is within half
+        # the segment of its midpoint, so TIER 1 walks half + min(capped max
+        # edge, l1) and owns the faces with longest edge <= that bound;
+        # faces in (bound, edgeLenCap] are the sweep's big-face list and
+        # veto_flips_big tests them face-centrically (atomic_min into the
+        # same tmin); faces with an edge > edgeLenCap are outside the
+        # guarantee and skipped (consistently with the host reference).
+        # atomic_min of the smallest hit parameter into tmin (pre-filled with
+        # 1, tier 2 runs concurrently); the island TOI scales a rigid move
+        # to it.
+        k = wp.tid()
+        v = ids[k]
+        p0 = pos[v]
+        d = disp[k]
+        half = 0.5 * wp.length(d)
+        mid = p0 + 0.5 * d
+        L = wp.min(bounds[0], l1)
+        r = half + L + 1.0e-4
+        best = float(1.0)
+        fg = flip_group[k]
+        query = wp.hash_grid_query(grid, mid, r)
+        u = wp.int32(0)
+        while wp.hash_grid_query_next(query, u):
+            du = wp.length(pos[u] - mid)
+            if du > r:
+                continue
+            if du > half + reach[u] + 1.0e-4:
+                continue  # exact prune (see vertex_reach)
+            for kk in range(vert_face_off[u], vert_face_off[u + 1]):
+                f = vert_face_ids[kk]
+                i0 = tri_ids[f, 0]
+                i1 = tri_ids[f, 1]
+                i2 = tri_ids[f, 2]
+                if i0 == v or i1 == v or i2 == v:
+                    continue  # own face
+                fl = face_longest[f]
+                if fl > L:
+                    continue  # tier-2 face (veto_flips_big) or oversized (skipped)
+                if (face_group[f] & fg) != wp.uint64(0):
+                    continue  # intended partner patch: may be crossed
+                # dedup: only the min-id face vertex IN RANGE processes f
+                m = u
+                if i0 != u and i0 < m and wp.length(pos[i0] - mid) <= r:
+                    m = i0
+                if i1 != u and i1 < m and wp.length(pos[i1] - mid) <= r:
+                    m = i1
+                if i2 != u and i2 < m and wp.length(pos[i2] - mid) <= r:
+                    m = i2
+                if m != u:
+                    continue
+                a0 = pos[i0]
+                e1 = pos[i1] - a0
+                e2 = pos[i2] - a0
+                h = wp.cross(d, e2)
+                det = wp.dot(e1, h)
+                if wp.abs(det) < 1.0e-14:
+                    continue
+                inv = 1.0 / det
+                s = p0 - a0
+                bu = wp.dot(s, h) * inv
+                if bu < 0.0 or bu > 1.0:
+                    continue
+                q = wp.cross(s, e1)
+                bv = wp.dot(d, q) * inv
+                if bv < 0.0 or bu + bv > 1.0:
+                    continue
+                t = wp.dot(e2, q) * inv
+                if t <= 0.0 or t >= 1.0:
+                    continue
+                if t < best:
+                    best = t
+        if best < 1.0:
+            wp.atomic_min(tmin, k, best)
+
+    @staticmethod
+    @wp.kernel
+    def scatter_flip_index(
+            ids: wp.array(dtype=wp.int32),
+            flip_of: wp.array(dtype=wp.int32)):    # out: flip_of[ids[k]] = k
+        k = wp.tid()
+        flip_of[ids[k]] = k
+
+    @staticmethod
+    @wp.kernel
+    def veto_flips_big(
+            grid: wp.uint64,                       # hash grid on CURRENT pos (the sweep's)
+            pos: wp.array(dtype=wp.vec3),
+            flip_of: wp.array(dtype=wp.int32),     # vertex -> flip index (-1 = none)
+            disp: wp.array(dtype=wp.vec3),
+            flip_group: wp.array(dtype=wp.uint64),
+            face_group: wp.array(dtype=wp.uint64),
+            tri_ids: wp.array2d(dtype=wp.int32),
+            face_longest: wp.array(dtype=float),
+            big: wp.array(dtype=wp.int32),         # tier-2 face list (see collect_big_faces)
+            big_count: wp.array(dtype=wp.int32),
+            dmax: float,                           # longest flip segment this round
+            tmin: wp.array(dtype=float)):          # in/out: atomic_min per flip
+        # TIER 2 of the device veto (see veto_flips), FACE-centric over the
+        # sweep's big-face list (longest edge in (tier-1 bound, edgeLenCap],
+        # same partition as detect_crossings_big -- positions are unchanged
+        # since the sweep): a flip segment crossing face f at q has |q - c|
+        # <= R (centroid radius) and its vertex within |d| <= dmax of q, so a
+        # walk of R + dmax from the centroid reaches the vertex of every flip
+        # that can cross f. Same allowed-set / own-face rules and exact test.
+        b = wp.tid()
+        if b >= wp.min(big_count[0], maxBigFaces):
+            return
+        f = big[b]
+        if face_longest[f] > edgeLenCap:
+            return
+        i0 = tri_ids[f, 0]
+        i1 = tri_ids[f, 1]
+        i2 = tri_ids[f, 2]
+        a0 = pos[i0]
+        a1 = pos[i1]
+        a2 = pos[i2]
+        c = (a0 + a1 + a2) / 3.0
+        R = wp.max(wp.length(a0 - c), wp.max(wp.length(a1 - c), wp.length(a2 - c)))
+        r = R + dmax + 1.0e-4
+        e1 = a1 - a0
+        e2 = a2 - a0
+        fgf = face_group[f]
+        query = wp.hash_grid_query(grid, c, r)
+        u = wp.int32(0)
+        while wp.hash_grid_query_next(query, u):
+            k = flip_of[u]
+            if k < 0:
+                continue
+            if u == i0 or u == i1 or u == i2:
+                continue  # own face
+            if (fgf & flip_group[k]) != wp.uint64(0):
+                continue  # intended partner patch: may be crossed
+            p0 = pos[u]
+            if wp.length(p0 - c) > r:
+                continue
+            d = disp[k]
+            h = wp.cross(d, e2)
+            det = wp.dot(e1, h)
+            if wp.abs(det) < 1.0e-14:
+                continue
+            inv = 1.0 / det
+            s = p0 - a0
+            bu = wp.dot(s, h) * inv
+            if bu < 0.0 or bu > 1.0:
+                continue
+            q = wp.cross(s, e1)
+            bv = wp.dot(d, q) * inv
+            if bv < 0.0 or bu + bv > 1.0:
+                continue
+            t = wp.dot(e2, q) * inv
+            if t <= 0.0 or t >= 1.0:
+                continue
+            wp.atomic_min(tmin, k, t)
 
     @staticmethod
     @wp.kernel
@@ -5253,6 +5720,365 @@ class Cloth(Input):
             m.append((c, float(sphere.radius) + uncrossMaskR))
         return m
 
+    def _cluster_island(self, members, cut_edges):
+        # Island test for one crossing cluster (see uncrossContour): flood the
+        # cluster's grid bbox (padded by one ring) from the pad ring with the
+        # cluster's crossing edges REMOVED. Cells the flood cannot reach are
+        # enclosed by the intersection contour = the poked-through tongue.
+        # Returns (island vertex ids, outer-ring vertex ids); both empty for
+        # an open contour / detection gap.
+        nc = self.numCols
+        nr = self.numParticles // nc
+        mem = np.asarray(members, dtype=np.int64)
+        rows = mem // nc
+        cols = mem % nc
+        rmin, rmax = int(rows.min()), int(rows.max())
+        cmin, cmax = int(cols.min()), int(cols.max())
+        r0, r1 = max(rmin - 1, 0), min(rmax + 1, nr - 1)
+        c0, c1 = max(cmin - 1, 0), min(cmax + 1, nc - 1)
+        H, W = r1 - r0 + 1, c1 - c0 + 1
+        seed = np.zeros((H, W), dtype=bool)
+        if r0 < rmin:
+            seed[0, :] = True
+        if r1 > rmax:
+            seed[-1, :] = True
+        if c0 < cmin:
+            seed[:, 0] = True
+        if c1 > cmax:
+            seed[:, -1] = True
+        empty = np.zeros(0, dtype=np.int64)
+        if not seed.any():
+            return empty, empty   # spans the whole grid: undefined
+        ce = np.asarray(cut_edges, dtype=np.int64).reshape(-1, 2)
+        ra, ca = ce[:, 0] // nc, ce[:, 0] % nc
+        rb, cb = ce[:, 1] // nc, ce[:, 1] % nc
+        cutH = np.zeros((H, W - 1), dtype=bool)   # (r,c)-(r,c+1)
+        cutV = np.zeros((H - 1, W), dtype=bool)   # (r,c)-(r+1,c)
+        h = (ra == rb) & (np.abs(ca - cb) == 1)
+        cutH[ra[h] - r0, np.minimum(ca[h], cb[h]) - c0] = True
+        v = (ca == cb) & (np.abs(ra - rb) == 1)
+        cutV[np.minimum(ra[v], rb[v]) - r0, ca[v] - c0] = True
+        # diagonal crossing edges need no cut: a contour crossing a cell
+        # crosses the cell's boundary (4-neighbor) edges too.
+        # Flood by RUNS: a maximal cut-free horizontal (vertical) run is
+        # internally connected, so one visited cell visits the whole run;
+        # alternating run propagation reaches a fixed point in ~#turns of
+        # the mainland path instead of its cell length (a long tongue had
+        # ~100 cell-frontier iterations over the whole bbox).
+        brkH = np.ones((H, W), dtype=bool)
+        brkH[:, 1:] = cutH
+        runH = np.cumsum(brkH.ravel()).reshape(H, W)          # 1-based run id
+        brkV = np.ones((H, W), dtype=bool)
+        brkV[1:, :] = cutV
+        runV = np.cumsum(brkV.T.ravel()).reshape(W, H).T
+        nH = int(runH[-1, -1]) + 1
+        nV = int(runV[-1, -1]) + 1
+        vis = seed.copy()
+        while True:
+            anyH = np.bincount(runH[vis], minlength=nH) > 0
+            anyV = np.bincount(runV[vis], minlength=nV) > 0
+            nxt = anyH[runH] | anyV[runV]
+            if np.array_equal(nxt, vis):
+                break
+            vis = nxt
+        isl = np.argwhere(~vis)
+        if not len(isl):
+            return empty, empty
+        # OUTER ring: island cells joined to a flooded (mainland) cell by a
+        # cut edge -- the contour facing the mainland. A nested island (flap
+        # through BOTH walls of a fold) also contains inner contour loops
+        # whose pair flips point both ways; only the outer ring defines the
+        # retraction direction, the rest of the island rides along bodily.
+        outer = np.zeros((H, W), dtype=bool)
+        outer[:, 1:] |= cutH & vis[:, :-1] & ~vis[:, 1:]
+        outer[:, :-1] |= cutH & vis[:, 1:] & ~vis[:, :-1]
+        outer[1:, :] |= cutV & vis[:-1, :] & ~vis[1:, :]
+        outer[:-1, :] |= cutV & vis[1:, :] & ~vis[:-1, :]
+        # diagonal cut edges: island endpoint whose partner is mainland
+        dg = ~(h | v)
+        if dg.any():
+            ia, ja = ce[dg, 0] // nc - r0, ce[dg, 0] % nc - c0
+            ib, jb = ce[dg, 1] // nc - r0, ce[dg, 1] % nc - c0
+            va_, vb_ = vis[ia, ja], vis[ib, jb]
+            outer[ia[~va_ & vb_], ja[~va_ & vb_]] = True
+            outer[ib[va_ & ~vb_], jb[va_ & ~vb_]] = True
+        out = np.argwhere(outer)
+        return ((isl[:, 0] + r0) * nc + (isl[:, 1] + c0),
+                (out[:, 0] + r0) * nc + (out[:, 1] + c0))
+
+    @staticmethod
+    def _components(a, b, nv):
+        # Connected components of the graph (nv vertices, edges a[i]-b[i]) by
+        # numpy min-label hooking + full pointer jumping; returns the root
+        # label per vertex. Converges in O(log nv) outer rounds.
+        parent = np.arange(nv, dtype=np.int64)
+        for _ in range(64):
+            pa = parent[a]
+            pb = parent[b]
+            if np.array_equal(pa, pb):
+                break
+            lo = np.minimum(pa, pb)
+            hi = np.maximum(pa, pb)
+            np.minimum.at(parent, hi, lo)
+            while True:
+                gp = parent[parent]
+                if np.array_equal(gp, parent):
+                    break
+                parent = gp
+        return parent
+
+    def _patch_faces(self, r0, r1, c0, c1):
+        # Faces with ANY vertex in grid rows [r0, r1] x cols [c0, c1]: the two
+        # triangles of every cell (R, C) with R in [r0-1, r1], C in [c0-1, c1]
+        # (regular grid layout, asserted at build: tris 2*(R*(numCols-1)+C)
+        # and +1 belong to cell (R, C), vertices rows R..R+1, cols C..C+1).
+        # O(bbox) instead of a 320k-face mask pass per island group.
+        ncell = self.numCols - 1
+        nr = self.numParticles // self.numCols
+        R = np.arange(max(r0 - 1, 0), min(r1, nr - 2) + 1, dtype=np.int64)
+        C = np.arange(max(c0 - 1, 0), min(c1, ncell - 1) + 1, dtype=np.int64)
+        base = 2 * (R[:, None] * ncell + C[None, :]).ravel()
+        return np.concatenate([base, base + 1])
+
+    def _contour_plan(self, ctx, blockedM):
+        # Contour-coherent flip plan (see uncrossContour). Returns a list of
+        # (ring_flip_vertices, island_interior_vertices, body_vec,
+        # allowed_faces) with ONE entry per contour group; all id arrays are
+        # global vertex / face ids (int64). ctx holds this round's crossing
+        # data (see _resolve_crossings): per valid pair rva/rvb/rf, the
+        # endpoint entries (ev, ed, en) with lv = local index into the sorted
+        # crossing vertices `verts`, the cluster id per local vertex (cid,
+        # members via corder/cstart) and the legacy vote side per local
+        # vertex (legacy_v).
+        T = self.hostTriIds
+        verts = ctx["verts"]
+        lv = ctx["lv"]
+        ev = ctx["ev"]
+        ed = ctx["ed"]
+        en = ctx["en"]
+        m = ctx["m"]
+        cid = ctx["cid"]
+        ncl = ctx["ncl"]
+        corder = ctx["corder"]
+        cstart = ctx["cstart"]
+        rva = ctx["rva"]
+        rvb = ctx["rvb"]
+        rf = ctx["rf"]
+        legacy_v = ctx["legacy_v"]
+        nv = len(verts)
+        pr_ = getattr(self, "_uncrossProf", None)
+        _tp = [time.perf_counter()]
+
+        def ptick(key):
+            if pr_ is not None:
+                now = time.perf_counter()
+                pr_[key] = pr_.get(key, 0.0) + now - _tp[0]
+                _tp[0] = now
+        # per-cluster pair lists (cut edges / partner faces)
+        rc = cid[lv[:m]]                       # cluster per valid pair
+        rorder = np.argsort(rc, kind="stable")
+        rstart = np.searchsorted(rc[rorder], np.arange(ncl + 1))
+        # group clusters that are the two sides of the same contour: a pair's
+        # partner-face vertex that is itself a crossing vertex of ANOTHER
+        # cluster links the two (A-edges x B-faces with B-edges x A-faces)
+        tv = T[rf].astype(np.int64).ravel()
+        pos_ = np.minimum(np.searchsorted(verts, tv), nv - 1)
+        present = verts[pos_] == tv
+        qa = np.repeat(rc, 3)[present]
+        qb = cid[pos_[present]]
+        link = qa != qb
+        if link.any():
+            groot = self._components(qa[link], qb[link], ncl)
+        else:
+            groot = np.arange(ncl)
+        _, gid = np.unique(groot, return_inverse=True)
+        gid = gid.reshape(-1)
+        ng = int(gid.max()) + 1
+        gorder = np.argsort(gid, kind="stable")
+        gstart = np.searchsorted(gid[gorder], np.arange(ng + 1))
+        ptick("plan.group")
+        nc = self.numCols
+        nr = self.numParticles // nc
+        plan = []
+        stats = getattr(self, "_contourStats", None)
+        markv = np.zeros(nv, dtype=bool)
+        markg = np.zeros(self.numParticles, dtype=bool)   # global scratch mask
+        for g in range(ng):
+            roots = gorder[gstart[g]:gstart[g + 1]]
+            cands = []
+            for r in roots:
+                mem_l = corder[cstart[r]:cstart[r + 1]]
+                mem = verts[mem_l]
+                prs = rorder[rstart[r]:rstart[r + 1]]
+                cut = np.stack([rva[prs], rvb[prs]], axis=1)
+                isl, outer = self._cluster_island(mem, cut)
+                ptick("plan.flood")
+                if len(isl):
+                    markg[mem] = True
+                    ring = outer[markg[outer]]
+                    markg[mem] = False
+                    if not len(ring):
+                        continue
+                    # flip-direction coherence of the OUTER ring (the flips
+                    # that face the mainland); an incoherent outer ring is a
+                    # sheet sandwiched between two opposing walls (the disk of
+                    # B inside a lobe of A) -- retracting it tears it apart
+                    markv[:] = False
+                    markv[np.searchsorted(verts, ring)] = True
+                    sel = markv[lv]                # entries of ring vertices
+                    dirs = -np.sign(ed[sel])[:, None] * en[sel]
+                    coh = float(np.linalg.norm(dirs.mean(axis=0))) if len(dirs) else 0.0
+                    if coh < uncrossCoherence:
+                        continue
+                    if int(blockedM[ring].sum()) * 2 > len(ring):
+                        continue   # island TOI-blocked this frame: try the other sheet
+                    cands.append((len(isl), int(r), ring, isl, coh, sel, prs))
+                ptick("plan.cand")
+            if cands:
+                cands.sort(key=lambda c: c[0])
+                nisl, r, ring, isl, coh, sel, prs = cands[0]
+                markg[ring] = True
+                interior = isl[~markg[isl]]
+                markg[ring] = False
+                bvec = None
+                allowed = None
+                if uncrossIslandBody and nisl <= uncrossIslandMax \
+                        and (len(interior) or uncrossIslandRigid):
+                    e_d = ed[sel]
+                    steps = (-np.sign(e_d) * (np.abs(e_d) + uncrossMargin))[:, None] * en[sel]
+                    bvec = steps.mean(axis=0)
+                    mnorm = float(np.linalg.norm(bvec))
+                    if uncrossIslandRigid and mnorm > 1.0e-9:
+                        # magnitude that clears the ring along the mean
+                        # direction: p90 of need / cos(own normal, mean)
+                        nb = bvec / mnorm
+                        needs = np.linalg.norm(steps, axis=1)
+                        cosv = np.maximum(np.abs(steps @ nb) / np.maximum(needs, 1e-12), 0.3)
+                        m_clear = float(np.percentile(needs / cosv, 90))
+                        bvec = nb * min(max(m_clear, mnorm), uncrossStepMax)
+                    elif mnorm > uncrossStepMax:
+                        bvec *= uncrossStepMax / mnorm
+                    # faces the island may cross: the partner sheet's local
+                    # patch = faces touching the grid bbox (padded 2) of the
+                    # partner faces' vertices + the partner clusters' vertices
+                    pv = [verts[corder[cstart[q]:cstart[q + 1]]] for q in roots if q != r]
+                    pv.append(T[rf[prs]].astype(np.int64).ravel())
+                    pv = np.concatenate(pv)
+                    if len(pv):
+                        pr, pc = pv // nc, pv % nc
+                        r0_, r1_ = max(int(pr.min()) - 2, 0), min(int(pr.max()) + 2, nr - 1)
+                        c0_, c1_ = max(int(pc.min()) - 2, 0), min(int(pc.max()) + 2, nc - 1)
+                        allowed = self._patch_faces(r0_, r1_, c0_, c1_)
+                    if allowed is None or not len(allowed):
+                        bvec = None   # no partner patch known: ring-only
+                        allowed = None
+                if stats is not None:
+                    mem_l = corder[cstart[r]:cstart[r + 1]]
+                    leg = verts[mem_l[legacy_v[mem_l]]]
+                    stats.append(("island", len(roots), nisl, len(ring), coh,
+                                  len(np.intersect1d(leg, ring)) / max(len(ring), 1)))
+                plan.append([ring, interior, bvec, allowed])
+                ptick("plan.island")
+            else:
+                # no island on any side: legacy vote on the cheapest cluster
+                best = None
+                for r in roots:
+                    mem_l = corder[cstart[r]:cstart[r + 1]]
+                    side_l = mem_l[legacy_v[mem_l]]
+                    markv[:] = False
+                    markv[side_l] = True
+                    cost = float(np.abs(ed[markv[lv]]).sum())
+                    if best is None or cost < best[0]:
+                        best = (cost, verts[side_l])
+                if stats is not None:
+                    stats.append(("legacy", len(roots), 0, len(best[1]), 0.0, 1.0))
+                plan.append([best[1], np.zeros(0, dtype=np.int64), None, None])
+                ptick("plan.legacy")
+        # (Instrumentation: self._uncrossProf dict = per-phase host timings,
+        # self._contourStats list = per-group island/legacy decisions,
+        # self._uncrossHook(stage, **kw) = sweep/apply callbacks -- all
+        # optional attributes set by benches, no cost when absent.)
+        # Nested tongues (A through B, then through C): the outer island
+        # contains the inner one; a rigid outer move must be allowed to cross
+        # BOTH partner patches, so overlapping islands share their masks.
+        rig = [i for i, p in enumerate(plan) if p[2] is not None and p[3] is not None]
+        if len(rig) > 1:
+            sets = [np.union1d(plan[i][0], plan[i][1]) for i in rig]
+            par = list(range(len(rig)))
+
+            def ufind(x):
+                while par[x] != x:
+                    par[x] = par[par[x]]
+                    x = par[x]
+                return x
+            for a in range(len(rig)):
+                for b in range(a + 1, len(rig)):
+                    if len(np.intersect1d(sets[a], sets[b], assume_unique=True)):
+                        ra_, rb_ = ufind(a), ufind(b)
+                        if ra_ != rb_:
+                            par[ra_] = rb_
+            comp = {}
+            for a in range(len(rig)):
+                comp.setdefault(ufind(a), []).append(a)
+            for mem in comp.values():
+                if len(mem) > 1:
+                    u = np.unique(np.concatenate([plan[rig[a]][3] for a in mem]))
+                    for a in mem:
+                        plan[rig[a]][3] = u
+        ptick("plan.union")
+        return [tuple(p) for p in plan]
+
+    def _sweep_crossings(self, l1=None):
+        # Exact crossing sweep on the CURRENT positions (device only, no sync):
+        # grid + bounds + per-vertex reach + per-face longest edge, tier-1
+        # edge walk and tier-2 big-face walk (see uncrossSweepL1). Leaves the
+        # grid built on self.pos (the device veto reuses it), the pair list in
+        # crossPairs/crossCount and the tier-2 list size in bigFaceCount.
+        if l1 is None:
+            l1 = uncrossSweepL1
+        self.grid.build(self.pos, gridCellSize)   # the SIM grid, at its width (see the note at uncrossSweepL1)
+        self.crossBounds.zero_()
+        wp.launch(kernel=Cloth.max_capped_edge_length,
+                  dim=boundsReduceThreads,
+                  inputs=[self.pos, self.edgeIds],
+                  outputs=[self.crossBounds])
+        wp.launch(kernel=Cloth.vertex_reach,
+                  dim=self.numParticles,
+                  inputs=[self.pos, self.triIds, self.vertFaceOff,
+                          self.vertFaceIds],
+                  outputs=[self.crossReach])
+        wp.launch(kernel=Cloth.face_longest_edges,
+                  dim=self.numTris,
+                  inputs=[self.pos, self.triIds],
+                  outputs=[self.crossFaceLongest])
+        self.bigFaceCount.zero_()
+        wp.launch(kernel=Cloth.collect_big_faces,
+                  dim=self.numTris,
+                  inputs=[self.crossFaceLongest, self.crossBounds, float(l1)],
+                  outputs=[self.bigFaceIds, self.bigFaceCount])
+        self.crossCount.zero_()
+        # tier 2 on the side stream, concurrent with the tier-1 walk (both
+        # append to crossPairs/crossCount with device-wide atomics); the
+        # pinned position readback the plan needs rides along too
+        s0 = wp.get_stream()
+        self.sideStream.wait_stream(s0)
+        with wp.ScopedStream(self.sideStream, sync_enter=False):
+            wp.launch(kernel=Cloth.detect_crossings_big,
+                      dim=maxBigFaces,
+                      inputs=[self.grid.id, self.pos, self.edgeIds, self.triIds,
+                              self.gridRC, self.vertEdgeOff, self.vertEdgeIds,
+                              self.crossReach, self.bigFaceIds, self.bigFaceCount],
+                      outputs=[self.crossPairs, self.crossCount])
+            wp.copy(self.pinPos, self.pos)
+        wp.launch(kernel=Cloth.detect_crossings,
+                  dim=self.numEdges,
+                  inputs=[self.grid.id, self.pos, self.edgeIds, self.triIds,
+                          self.gridRC, self.vertFaceOff, self.vertFaceIds,
+                          self.crossBounds, self.crossReach,
+                          self.crossFaceLongest, float(l1)],
+                  outputs=[self.crossPairs, self.crossCount])
+        s0.wait_stream(self.sideStream)
+
     def _resolve_crossings(self, max_n=None, mask=None):
         # Crossing resolver (see the uncross* constants): exact intersection
         # sweep on the current positions, then a host-side CLUSTER vote that
@@ -5267,82 +6093,175 @@ class Cloth(Input):
         # cascade note at uncrossIters).
         im = None
         found = 0        # first-sweep crossing count (returned for idle backoff)
-        moved = set()    # flipped this frame: final, never flipped again
-        blocked = set()  # veto'd this frame: the pair retries its other endpoint
+        movedM = None    # flipped this frame: final, never flipped again (bool mask)
+        blockedM = None  # veto'd this frame: the pair retries its other endpoint
+        prof = getattr(self, "_uncrossProf", None)
+        _t = [time.perf_counter()]
+        if prof is not None:
+            prof["passes"] = prof.get("passes", 0) + 1
+
+        def tick(key):
+            if prof is not None:
+                now = time.perf_counter()
+                prof[key] = prof.get(key, 0.0) + (now - _t[0])
+                _t[0] = now
         rounds = uncrossIters
+        E = self.hostEdgeIds
+        T = self.hostTriIds
         for _it in range(max(uncrossIters, uncrossBurstIters)):
             if _it >= rounds:
                 break
-            self.grid.build(self.pos, gridCellSize)
-            self.crossBounds.zero_()
-            wp.launch(kernel=Cloth.max_edge_length,
-                      dim=boundsReduceThreads,
-                      inputs=[self.pos, self.edgeIds],
-                      outputs=[self.crossBounds])
-            self.crossCount.zero_()
-            wp.launch(kernel=Cloth.detect_crossings,
-                      dim=self.numEdges,
-                      inputs=[self.grid.id, self.pos, self.edgeIds, self.triIds,
-                              self.gridRC, self.vertFaceOff, self.vertFaceIds,
-                              self.crossBounds],
-                      outputs=[self.crossPairs, self.crossCount])
+            if _it > 0 and self._uncross_over_budget():
+                break
+            if prof is not None:
+                wp.synchronize_device()   # attribute pending GPU work (substeps) to "sim"
+                tick("sim.wait")
+                prof["rounds"] = prof.get("rounds", 0) + 1
+            _t_round = time.perf_counter()
+            self._sweep_crossings()
             n = int(self.crossCount.numpy()[0])  # device read: syncs the stream
+            if int(self.bigFaceCount.numpy()[0]) > maxBigFaces:
+                # tier-2 list overflowed (extreme stretch wad): redo as a
+                # single-tier sweep at the cap so no face is skipped
+                self._sweep_crossings(l1=edgeLenCap)
+                n = int(self.crossCount.numpy()[0])
+            wp.copy(self.pinPairs, self.crossPairs)   # pinned readback
+            wp.synchronize_stream()
+            pairs = self.pinPairs.numpy()[:min(n, maxCross)]
+            tick("sweep")
+            hook = getattr(self, "_uncrossHook", None)  # instrumentation (bench only)
+            if hook is not None:
+                _th = time.perf_counter()
+                hook("sweep", it=_it, n=n, pairs=pairs.copy())
+                _t_round += time.perf_counter() - _th   # hook time is not budgeted
             if _it == 0:
                 found = n
+                self._lastFound = n   # bench/diagnostics: resolver-visible count
+                if max_n is None and getattr(self, "_uncrossBudget", None) is None:
+                    # first (frame-start) pass: size the frame's budget
+                    self._uncrossBudget = min(uncrossBudgetMs,
+                                              max(uncrossBudgetMin,
+                                                  uncrossBudgetPerPair * n))
                 # Large-wad recovery burst (quiescent path only, see
                 # uncrossBurstN): peel several contour rings this frame.
                 if max_n is None and n > uncrossBurstN:
                     rounds = max(rounds, uncrossBurstIters)
             if n == 0 or (max_n is not None and n > max_n):
+                self._uncrossSpent += time.perf_counter() - _t_round
                 return found
             if _UNCROSS_DEBUG:
                 print(f"[uncross] it{_it}: {n} crossed pairs", flush=True)
             n = min(n, maxCross)
-            pairs = self.crossPairs.numpy()[:n]
-            P = self.pos.numpy()
+            P = self.pinPos.numpy()   # pinned readback issued by the sweep
+            N = self.numParticles
             if im is None:
                 im = self.hostInvMass.numpy()
-            E = self.hostEdgeIds
-            T = self.hostTriIds
-            disp = {}
-            need = {}      # target vertex -> deepest single-pair flip distance
-            partners = {}  # target vertex -> intended partner face ids
-            recs = []      # (va, vb, f, nf, da, db) per valid crossed pair
-            for e, f in pairs:
-                va, vb = int(E[e, 0]), int(E[e, 1])
-                if mask:
-                    mid = 0.5 * (P[va] + P[vb])
-                    if any(np.linalg.norm(mid - mc) < mr for mc, mr in mask):
-                        continue  # forcing site: leave to post-release
-                i0, i1, i2 = int(T[f, 0]), int(T[f, 1]), int(T[f, 2])
-                a0 = P[i0]
-                nf = np.cross(P[i1] - a0, P[i2] - a0)
-                ln = np.linalg.norm(nf)
-                if ln < 1.0e-12:
-                    continue
-                nf /= ln
-                da = float(np.dot(P[va] - a0, nf))
-                db = float(np.dot(P[vb] - a0, nf))
-                if da * db > 0.0:
-                    continue  # float-noise mismatch with the exact test: skip
-                recs.append((va, vb, int(f), nf, da, db))
+                movedM = np.zeros(N, dtype=bool)
+                blockedM = np.zeros(N, dtype=bool)
+                # per-round scratch, allocated once per pass and reset on the
+                # touched entries only (see the end of the round)
+                vgroup = np.zeros(N, dtype=np.uint64)
+                in_island = np.zeros(N, dtype=bool)      # array-moved this round
+                dispG = np.zeros((N, 3), dtype=np.float64)
+                needG = np.zeros(N, dtype=np.float64)    # deepest single-pair need
+                inDisp = np.zeros(N, dtype=bool)
+                elig_v = im != 0.0                       # free, not moved/blocked this pass
+            # (va, vb, f, nf, da, db) per valid crossed pair -- vectorized
+            pe = pairs[:, 0].astype(np.int64)
+            pfc = pairs[:, 1].astype(np.int64)
+            pva = E[pe, 0].astype(np.int64)
+            pvb = E[pe, 1].astype(np.int64)
+            a0 = P[T[pfc, 0]]
+            nfv = np.cross(P[T[pfc, 1]] - a0, P[T[pfc, 2]] - a0)
+            lnv = np.linalg.norm(nfv, axis=1)
+            valid = lnv > 1.0e-12
+            nfv = nfv / np.maximum(lnv, 1.0e-30)[:, None]
+            dav = np.einsum('ij,ij->i', P[pva] - a0, nfv)
+            dbv = np.einsum('ij,ij->i', P[pvb] - a0, nfv)
+            valid &= dav * dbv <= 0.0   # float-noise mismatch with the exact test
+            if mask:
+                midv = 0.5 * (P[pva] + P[pvb])
+                for mc, mr in mask:      # forcing site: leave to post-release
+                    valid &= np.linalg.norm(midv - mc, axis=1) >= mr
+            rva = pva[valid]
+            rvb = pvb[valid]
+            rf = pfc[valid]
+            rnf = nfv[valid].astype(np.float64)
+            rda = dav[valid].astype(np.float64)
+            rdb = dbv[valid].astype(np.float64)
+            m = len(rf)
+            recs = None
+            if hook is not None:
+                recs = list(zip(rva.tolist(), rvb.tolist(), rf.tolist(), rnf,
+                                rda.tolist(), rdb.tolist()))
+            tick("recs")
+            if m == 0:
+                self._uncrossSpent += time.perf_counter() - _t_round
+                return found
 
-            def add_flip(s, ds, nf, f):
-                step = -np.sign(ds) * (abs(ds) + uncrossMargin) * nf
-                disp[s] = disp.get(s, 0.0) + step
-                need[s] = max(need.get(s, 0.0), abs(ds) + uncrossMargin)
-                partners.setdefault(s, []).append(f)
+            # Allowed-set GROUP BITS for the no-new-crossing veto (host and
+            # device use the same policy, see veto_flips / _veto_flips_vec):
+            # every flip carries the bits of the contour groups it serves,
+            # every face the bits of the groups allowed to cross it (partner
+            # faces + their vertex-adjacent neighbors for ring flips, the
+            # partner sheet's patch for island moves). > 64 groups share bits
+            # round-robin (slightly permissive, never restrictive).
+            face_group = self.pinFaceGroup.numpy()   # pinned host mirror
+            face_group.fill(0)
+            gcount = [0]
+            vfo_ = self.hostVertFaceOff.astype(np.int64)
+            vfi_ = self.hostVertFaceIds
+            # endpoint entries (both endpoints of every valid pair) and their
+            # local index into the sorted crossing-vertex list
+            ev = np.concatenate([rva, rvb])
+            ed = np.concatenate([rda, rdb])
+            en = np.concatenate([rnf, rnf])
+            ef = np.concatenate([rf, rf])
+            verts, lv = np.unique(ev, return_inverse=True)
+            lv = lv.reshape(-1)
+            nv = len(verts)
 
+            def new_bit():
+                b = np.uint64(1) << np.uint64(gcount[0] % 64)
+                gcount[0] += 1
+                return b
+
+            def add_flips(sel, gbit):
+                # ring flips for the endpoint entries `sel`: each vertex steps
+                # back across its partner plane by depth + margin (summed over
+                # its pairs); group bits on the vertex, its partner faces and
+                # their vertex-adjacent neighbors (the same local surface)
+                vs = ev[sel]
+                d = ed[sel]
+                step = (-np.sign(d) * (np.abs(d) + uncrossMargin))[:, None] * en[sel]
+                np.add.at(dispG, vs, step)
+                np.maximum.at(needG, vs, np.abs(d) + uncrossMargin)
+                inDisp[vs] = True
+                vgroup[vs] |= gbit
+                fs = np.unique(ef[sel])
+                face_group[fs] |= gbit
+                fv = np.unique(T[fs].ravel()).astype(np.int64)
+                cnt = vfo_[fv + 1] - vfo_[fv]
+                tot = int(cnt.sum())
+                if tot:
+                    starts = np.repeat(vfo_[fv], cnt)
+                    within = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+                    face_group[vfi_[starts + within]] |= gbit
+
+            islands = []   # rigid island moves this round: vertex id arrays
+            isl_ids = []   # rigid island moves: (vertex id array, bvec)
             if uncrossVote == "pair":
-                # independent per-pair least-motion (fallback policy)
-                for va, vb, f, nf, da, db in recs:
-                    s, ds = (va, da) if abs(da) <= abs(db) else (vb, db)
-                    o, do_ = (vb, db) if s == va else (va, da)
-                    if im[s] == 0.0 or s in moved or s in blocked:
-                        s, ds = o, do_
-                        if im[s] == 0.0 or s in moved or s in blocked:
-                            continue
-                    add_flip(s, ds, nf, f)
+                # independent per-pair least-motion (fallback policy): the
+                # shallow endpoint, else the other one, skipping ineligible
+                sa = np.abs(rda) <= np.abs(rdb)
+                first = np.where(sa, rva, rvb)
+                second = np.where(sa, rvb, rva)
+                use_first = elig_v[first]
+                use_second = ~use_first & elig_v[second]
+                sel = np.concatenate([np.where(sa, use_first, use_second),
+                                      np.where(sa, use_second, use_first)])
+                if sel.any():
+                    add_flips(sel, new_bit())
             else:
                 # CLUSTER vote: union-find the crossing edges into contour
                 # clusters (shared endpoints) and flip ONE coherent side per
@@ -5353,79 +6272,145 @@ class Cloth(Input):
                 # with fewer vertices (the intruded tongue) flips; on a tie,
                 # the side with the smaller total depth (least region
                 # motion).
-                parent = {}
+                la = lv[:m]
+                lb = lv[m:]
+                root = Cloth._components(la, lb, nv)
+                _, cid = np.unique(root, return_inverse=True)
+                cid = cid.reshape(-1)
+                ncl = int(cid.max()) + 1
+                corder = np.argsort(cid, kind="stable")
+                cstart = np.searchsorted(cid[corder], np.arange(ncl + 1))
+                dsum = np.bincount(lv, weights=ed, minlength=nv)
+                plus = dsum > 0.0
+                n_plus = np.bincount(cid, weights=plus, minlength=ncl)
+                n_minus = np.bincount(cid, weights=~plus, minlength=ncl)
+                adp = np.abs(dsum)
+                dp = np.bincount(cid, weights=adp * plus, minlength=ncl)
+                dm = np.bincount(cid, weights=adp * ~plus, minlength=ncl)
+                flip_plus = np.where(n_plus != n_minus, n_plus < n_minus, dp <= dm)
+                legacy_v = plus == flip_plus[cid]   # per local vertex
+                markv = np.zeros(nv, dtype=bool)
+                tick("plan.pre")
 
-                def find(x):
-                    while parent.get(x, x) != x:
-                        parent[x] = parent.get(parent[x], parent[x])
-                        x = parent[x]
-                    return x
+                def side_entries(side):
+                    # endpoint entries of the (global id) vertices `side` that
+                    # are eligible to flip this round
+                    markv[:] = False
+                    markv[np.searchsorted(verts, side)] = True
+                    return markv[lv] & elig_v[ev] & ~in_island[ev]
 
-                def union(x, y):
-                    rx, ry = find(x), find(y)
-                    if rx != ry:
-                        parent[rx] = ry
-
-                vdep = {}
-                for va, vb, f, nf, da, db in recs:
-                    union(va, vb)
-                    vdep.setdefault(va, []).append((da, nf, f))
-                    vdep.setdefault(vb, []).append((db, nf, f))
-                clusters = {}
-                for v in vdep:
-                    clusters.setdefault(find(v), []).append(v)
-                for members in clusters.values():
-                    dsum = {v: sum(d for d, _, _ in vdep[v]) for v in members}
-                    plus = [v for v in members if dsum[v] > 0.0]
-                    minus = [v for v in members if dsum[v] <= 0.0]
-                    if len(plus) != len(minus):
-                        flip = plus if len(plus) < len(minus) else minus
-                    else:
-                        dp = sum(abs(dsum[v]) for v in plus)
-                        dm = sum(abs(dsum[v]) for v in minus)
-                        flip = plus if dp <= dm else minus
-                    for v in flip:
-                        if im[v] == 0.0 or v in moved or v in blocked:
+                body = []   # island-interior bodily moves (non-rigid): (ids, vec, bits)
+                if uncrossContour:
+                    # One sheet per contour (see uncrossContour): group the
+                    # paired clusters, pick the island sheet, flip its
+                    # island-side contour ring (+ optionally its interior).
+                    plan = self._contour_plan(
+                        dict(verts=verts, lv=lv, ev=ev, ed=ed, en=en, m=m, cid=cid,
+                             ncl=ncl, corder=corder, cstart=cstart, rva=rva,
+                             rvb=rvb, rf=rf, legacy_v=legacy_v), blockedM)
+                    _t[0] = time.perf_counter()   # (accounted by the plan.* sub-ticks)
+                    for flip, interior, bvec, ballowed in plan:
+                        gbit = new_bit()
+                        if ballowed is not None:
+                            face_group[ballowed] |= gbit
+                        if bvec is not None and uncrossIslandRigid:
+                            # RIGID island move: ring and interior share one
+                            # vector (no island-internal distortion -> no
+                            # self-crossings); not locked by `moved` so a
+                            # ring that did not fully clear continues next
+                            # round (direction is contour-consistent).
+                            vs = np.concatenate([flip, interior])
+                            vs = vs[(im[vs] != 0.0) & ~in_island[vs] & ~blockedM[vs]
+                                    & ~inDisp[vs]]
+                            if not len(vs):
+                                continue
+                            in_island[vs] = True
+                            vgroup[vs] |= gbit
+                            isl_ids.append((vs, bvec))
+                            islands.append(vs)
                             continue
-                        for d, nf, f in vdep[v]:
-                            add_flip(v, d, nf, f)
-            if not disp:
+                        sel = side_entries(flip)
+                        if sel.any():
+                            add_flips(sel, gbit)
+                        if uncrossIslandBody and len(interior) and bvec is not None:
+                            iv = interior[(im[interior] != 0.0) & ~movedM[interior]
+                                          & ~blockedM[interior] & ~inDisp[interior]]
+                            body.append((iv, bvec, gbit))
+                else:
+                    for c in range(ncl):
+                        mem_l = corder[cstart[c]:cstart[c + 1]]
+                        sel = side_entries(verts[mem_l[legacy_v[mem_l]]])
+                        if sel.any():
+                            add_flips(sel, new_bit())
+                for iv, bvec, gbit in body:
+                    iv = iv[~inDisp[iv] & ~in_island[iv]]
+                    if not len(iv):
+                        continue
+                    dispG[iv] = bvec
+                    needG[iv] = float(np.linalg.norm(bvec))
+                    inDisp[iv] = True
+                    vgroup[iv] = gbit        # veto allowed-set = the patch mask
+            tick("plan")
+            ids_d = np.flatnonzero(inDisp)
+            if not len(ids_d) and not isl_ids:
+                self._uncrossSpent += time.perf_counter() - _t_round
                 return found
+            # assemble the flip arrays: seed flips + rigid islands
+            ids_i = [ids_d]
+            dv_i = [dispG[ids_d]]
+            cap_i = [np.minimum(np.maximum(needG[ids_d], uncrossStep), uncrossStepMax)]
+            for vs, bvec in isl_ids:
+                ids_i.append(vs)
+                dv_i.append(np.broadcast_to(bvec, (len(vs), 3)))
+                cap_i.append(np.full(len(vs), float(np.linalg.norm(bvec))))
+            ids_all = np.concatenate(ids_i)
+            dv_all = np.concatenate(dv_i)
+            cap_all = np.concatenate(cap_i)
+            seed_ids = frozenset(ids_all.tolist()) if hook is not None else None
             # Regional dilation (see uncrossDilate): drag each flip's grid
             # neighborhood along so the pleat lobe moves bodily instead of
             # having its crossed ring yanked back by interior tension.
             if uncrossDilate > 0:
-                nrows = self.numParticles // self.numCols
-                frontier = dict(disp)
+                nrows = N // self.numCols
+                ncs = self.numCols
+                taken = inDisp | in_island | movedM | blockedM | (im == 0.0)
+                f_ids = ids_all
+                f_dv = dv_all
                 for _ring in range(uncrossDilate):
-                    acc = {}
-                    for v, dvv in frontier.items():
-                        r, c = v // self.numCols, v % self.numCols
-                        if r > 0:
-                            acc.setdefault(v - self.numCols, []).append((v, dvv))
-                        if r < nrows - 1:
-                            acc.setdefault(v + self.numCols, []).append((v, dvv))
-                        if c > 0:
-                            acc.setdefault(v - 1, []).append((v, dvv))
-                        if c < self.numCols - 1:
-                            acc.setdefault(v + 1, []).append((v, dvv))
-                    frontier = {}
-                    for u, contrib in acc.items():
-                        if u in disp or u in moved or u in blocked \
-                                or im[u] == 0.0:
-                            continue
-                        step = uncrossDilateGain \
-                            * (sum(d for _, d in contrib) / len(contrib))
-                        disp[u] = step
-                        need[u] = float(np.linalg.norm(step))
-                        # veto allowed-set: inherit the contributing seeds'
-                        # intended partner faces
-                        pl = partners.setdefault(u, [])
-                        for sv, _ in contrib:
-                            pl.extend(partners.get(sv, ()))
-                        frontier[u] = step
-            ids = np.fromiter(disp.keys(), dtype=np.int32, count=len(disp))
-            dv = np.stack([disp[int(i)] for i in ids]).astype(np.float32)
+                    r = f_ids // ncs
+                    c = f_ids % ncs
+                    srcs = []
+                    nbs = []
+                    for cond, off in ((r > 0, -ncs), (r < nrows - 1, ncs),
+                                      (c > 0, -1), (c < ncs - 1, 1)):
+                        srcs.append(np.nonzero(cond)[0])
+                        nbs.append(f_ids[cond] + off)
+                    src = np.concatenate(srcs)
+                    nb = np.concatenate(nbs)
+                    ok_ = ~taken[nb]
+                    src = src[ok_]
+                    nb = nb[ok_]
+                    if not len(nb):
+                        break
+                    uniq, inv = np.unique(nb, return_inverse=True)
+                    acc = np.zeros((len(uniq), 3), dtype=np.float64)
+                    np.add.at(acc, inv, f_dv[src])
+                    cnt = np.bincount(inv, minlength=len(uniq))
+                    steps_ = uncrossDilateGain * acc / cnt[:, None]
+                    taken[uniq] = True
+                    # veto allowed-set: inherit the contributing seeds' bits
+                    gb = np.zeros(len(uniq), dtype=np.uint64)
+                    np.bitwise_or.at(gb, inv, vgroup[f_ids[src]])
+                    vgroup[uniq] |= gb
+                    ids_all = np.concatenate([ids_all, uniq])
+                    dv_all = np.concatenate([dv_all, steps_])
+                    cap_all = np.concatenate([cap_all, np.linalg.norm(steps_, axis=1)])
+                    f_ids = uniq
+                    f_dv = steps_
+            tick("dilate")
+            ids = ids_all.astype(np.int32)
+            dv = dv_all.astype(np.float32)
+            cap = cap_all
             mag = np.linalg.norm(dv, axis=1)
             # DEPTH-COMPLETE step cap (see uncrossStepMax): a flip that cannot
             # reach past the partner plane is worse than useless -- it lands
@@ -5440,9 +6425,6 @@ class Cloth(Input):
             # legacy uncrossStep, bounded by uncrossStepMax; the no-new-
             # crossing veto below exact-tests the full longer segment, so a
             # deep flip through a third layer is still rejected.
-            cap = np.fromiter(
-                (min(max(need[int(i)], uncrossStep), uncrossStepMax)
-                 for i in ids), dtype=np.float64, count=len(ids))
             over = mag > cap
             dv[over] *= (cap[over] / mag[over])[:, None]
             # NO-NEW-CROSSING VETO: in a multi-layer pile (or a tightly
@@ -5451,107 +6433,235 @@ class Cloth(Input):
             # THROUGH a third layer sitting just behind -- the next frame's
             # sweep then flips it back (oscillation: the knot never resolves,
             # and the churn pumps stretch). Exact-test each flip segment
-            # against the nearby faces; only the recorded partner faces and
-            # their vertex-adjacent neighbors (the same local surface, in
-            # case the segment exits through a coplanar neighbor of f) may be
-            # crossed -- ANY other face vetoes the flip. A vetoed vertex is
-            # blocked for this frame so the pair retries with its other
-            # endpoint next iteration.
-            P0 = P[ids]
-            P1 = P0 + dv
-            lo = np.minimum(P0, P1).min(axis=0) - 0.03
-            hi = np.maximum(P0, P1).max(axis=0) + 0.03
-            tc = (P[T[:, 0]] + P[T[:, 1]] + P[T[:, 2]]) / 3.0
-            tr = np.maximum(np.linalg.norm(P[T[:, 0]] - tc, axis=1),
-                            np.maximum(np.linalg.norm(P[T[:, 1]] - tc, axis=1),
-                                       np.linalg.norm(P[T[:, 2]] - tc, axis=1)))
-            cand = np.nonzero(np.all((tc + tr[:, None] >= lo)
-                                     & (tc - tr[:, None] <= hi), axis=1))[0]
-            keep = np.ones(len(ids), dtype=bool)
-            if len(cand) and uncrossVetoVec:
-                # VECTORIZED veto (2026-09): the per-flip loop below tests
-                # every flip against EVERY face in the joint bbox -- O(flips
-                # x bbox faces), ~5 s per round on a 2k-pair 400^2 wad
-                # spread across the pile (10k dilated flips x 100k faces),
-                # i.e. minutes per recovery frame with burst rounds and the
-                # settle-interleave. Same candidate semantics (every face
-                # whose centroid lies within slen + tr + 1e-5 of the segment
-                # midpoint), found through a uniform grid on the candidate
-                # face centroids and tested with one batched Moller-Trumbore
-                # over the (flip, face) pairs. UNCROSS_VETO_VEC=0 restores
-                # the loop; UNCROSS_VETO_CHECK=1 runs both and asserts.
-                keep = self._veto_flips_vec(ids, dv, P0, P, T, cand, tc, tr,
-                                            partners)
-                if uncrossVetoCheck:
-                    keep_ref = self._veto_flips_loop(ids, dv, P0, P, T, cand,
-                                                     tc, tr, partners, set())
-                    if not np.array_equal(keep, keep_ref):
+            # against the nearby faces; only the faces carrying one of the
+            # flip's group bits (its contour's partner faces and their
+            # vertex-adjacent neighbors -- the same local surface, in case the
+            # segment exits through a coplanar neighbor -- or the partner
+            # sheet's patch for an island move) may be crossed; ANY other
+            # face vetoes the flip. A vetoed vertex is blocked for this frame
+            # so the pair retries with its other endpoint next iteration.
+            # Device kernel by default (the host veto was 65% of a recovery
+            # frame); UNCROSS_VETO_GPU=0 runs the numpy reference instead,
+            # UNCROSS_VETO_CHECK=1 runs both and asserts they agree.
+            tick("cap")
+            fg = vgroup[ids]
+            keep = tmin = None
+            if uncrossVetoGpu:
+                keep, tmin = self._veto_flips_gpu(ids, dv, fg)
+                tick("veto")
+            if keep is None or uncrossVetoCheck:
+                keep_h, tmin_h = self._veto_flips_vec(ids, dv, P, T, fg, face_group)
+                tick("veto.host")
+                if keep is None:
+                    keep, tmin = keep_h, tmin_h
+                else:
+                    diff = int((keep != keep_h).sum())
+                    both = ~keep & ~keep_h
+                    tdiff = float(np.abs(tmin[both] - tmin_h[both]).max()) if both.any() else 0.0
+                    print(f"[uncross] veto check: gpu {int((~keep).sum())} vs host "
+                          f"{int((~keep_h).sum())} vetoes, {diff} differ of {len(ids)}, "
+                          f"max |dt| {tdiff:.1e}", flush=True)
+                    if diff:
                         raise AssertionError(
-                            f"[uncross] veto mismatch: vec {int((~keep).sum())} "
-                            f"vs loop {int((~keep_ref).sum())} vetoes")
-                for s in ids[~keep]:
-                    blocked.add(int(s))
-            elif len(cand):
-                keep = self._veto_flips_loop(ids, dv, P0, P, T, cand, tc, tr,
-                                             partners, blocked)
+                            f"[uncross] veto mismatch: gpu {int((~keep).sum())} vs host "
+                            f"{int((~keep_h).sum())} vetoes ({diff} differ)")
+            if islands:
+                # ISLAND TOI: a rigid island move that would carry some of
+                # its vertices through a foreign layer is SCALED to the first
+                # hit (the island slides up to the layer and continues next
+                # round) instead of dropping those vertices -- leaving part
+                # of an island behind crumples it onto itself (measured: 230
+                # island-internal crossings per round at 18 mm rigid steps
+                # in a pile). A hit closer than uncrossIslandMinStep blocks
+                # the island's ring for the frame (the other sheet may then
+                # be picked).
+                pos_of = np.full(N, -1, dtype=np.int64)
+                pos_of[ids] = np.arange(len(ids))
+                for vset in islands:
+                    ks = pos_of[vset]
+                    ks = ks[ks >= 0]
+                    if not len(ks) or keep[ks].all():
+                        continue
+                    # a low percentile, not the min: on a 15k-vertex island
+                    # a handful of grazing contacts must not stall the whole
+                    # body (the few below it stay)
+                    t_star = float(np.percentile(tmin[ks], uncrossIslandToiPct))
+                    mag = float(np.linalg.norm(dv[ks[0]]))
+                    if t_star * mag >= uncrossIslandMinStep:
+                        dv[ks] *= 0.9 * t_star
+                        keep[ks] = tmin[ks] >= t_star
+                    # else: a layer sits right against the island on the
+                    # retraction side -- move what can move (the hit
+                    # vertices stay; local distortion, but progress)
+            # island vertices left behind by the TOI cut are NOT blocked:
+            # the island re-evaluates them next round from its new place
+            is_isl = in_island[ids]
+            blockedM[ids[~keep & ~is_isl]] = True
+            elig_v[ids[~keep & ~is_isl]] = False
             if _UNCROSS_DEBUG:
                 print(f"[uncross]   apply={int(keep.sum())} veto={int((~keep).sum())}",
                       flush=True)
+            if hook is not None:
+                need = {int(v): float(needG[v]) for v in ids_d}
+                for vs, bvec in isl_ids:
+                    nb_ = float(np.linalg.norm(bvec))
+                    need.update((int(v), nb_) for v in vs)
+                _th = time.perf_counter()
+                hook("apply", it=_it, ids=ids.copy(), dv=dv.copy(), keep=keep.copy(),
+                     seeds=seed_ids, need=need, recs=recs)
+                _t_round += time.perf_counter() - _th   # hook time is not budgeted
+            # reset the per-round scratch on the touched entries (all of
+            # ids_all: seeds, islands, dilation) for the next round
+            vgroup[ids_all] = 0
+            in_island[ids_all] = False
+            dispG[ids_all] = 0.0
+            needG[ids_all] = 0.0
+            inDisp[ids_all] = False
             ids = ids[keep]
             dv = dv[keep]
+            is_isl = is_isl[keep]
+            if prof is not None:
+                prof["flips"] = prof.get("flips", 0) + int(len(ids))
             if not len(ids):
+                self._uncrossSpent += time.perf_counter() - _t_round
                 continue  # everything veto'd: retry other endpoints next iter
-            moved.update(int(i) for i in ids)
+            movedM[ids[~is_isl]] = True
+            elig_v[ids[~is_isl]] = False
+            n2 = len(ids)
+            self.pinIds.numpy()[:n2] = ids
+            self.pinDv.numpy()[:n2] = dv
+            wp.copy(self.vetoIds, self.pinIds, count=n2)
+            wp.copy(self.vetoDv, self.pinDv, count=n2)
             wp.launch(kernel=Cloth.apply_uncross,
-                      dim=len(ids),
-                      inputs=[wp.array(ids, dtype=wp.int32),
-                              wp.array(dv, dtype=wp.vec3), self.pos])
+                      dim=n2,
+                      inputs=[self.vetoIds, self.vetoDv, self.pos])
+            tick("apply")
+            self._uncrossSpent += time.perf_counter() - _t_round
         return found
 
-    def _allowed_codes(self, ids, partners, T, ks):
-        # (flip index k, face f) codes of the faces a flip segment MAY cross:
-        # its recorded partner faces and their vertex-adjacent neighbors --
-        # only for the flips ks that still have an external candidate.
-        vfo = self.hostVertFaceOff
-        vfi = self.hostVertFaceIds
-        nT = T.shape[0]
-        codes = []
-        cache = {}   # dilated flips inherit their seeds' lists: share the work
-        for k in ks:
-            k = int(k)
-            pl = partners[int(ids[k])]
-            if not pl:
-                continue
-            key = tuple(sorted(set(pl)))
-            fs = cache.get(key)
-            if fs is None:
-                pf = np.asarray(key, dtype=np.int64)
-                verts = np.unique(T[pf].ravel())
-                parts = [pf]
-                for pv in verts:
-                    parts.append(vfi[vfo[pv]:vfo[pv + 1]].astype(np.int64))
-                fs = cache[key] = np.unique(np.concatenate(parts))
-            codes.append(k * nT + fs)
-        if not codes:
-            return np.zeros(0, dtype=np.int64)
-        return np.unique(np.concatenate(codes))
+    def _uncross_over_budget(self):
+        # see uncrossBudgetMs (the frame's budget / spent time are reset by
+        # simulate; the budget is sized by the frame's first sweep)
+        b = getattr(self, "_uncrossBudget", None)
+        return uncrossBudgetMs > 0.0 and b is not None and \
+            getattr(self, "_uncrossSpent", 0.0) * 1e3 >= b
 
-    def _veto_flips_vec(self, ids, dv, P0, P, T, cand, tc, tr, partners):
+    def _ensure_veto_capacity(self, n):
+        # Device + pinned staging for the flip veto/apply (grown on demand,
+        # outside any graph capture: the resolver runs between replays).
+        cur = self.vetoIds.shape[0] if getattr(self, "vetoIds", None) is not None else 0
+        if n <= cur:
+            return
+        cap = max(n, 2 * cur, 4096)
+        self.vetoIds = wp.zeros(cap, dtype=wp.int32)
+        self.vetoDv = wp.zeros(cap, dtype=wp.vec3)
+        self.vetoGroup = wp.zeros(cap, dtype=wp.uint64)
+        self.vetoT = wp.zeros(cap, dtype=float)
+        self.pinIds = wp.zeros(cap, dtype=wp.int32, device="cpu", pinned=True)
+        self.pinDv = wp.zeros(cap, dtype=wp.vec3, device="cpu", pinned=True)
+        self.pinGroup = wp.zeros(cap, dtype=wp.uint64, device="cpu", pinned=True)
+        self.pinT = wp.zeros(cap, dtype=float, device="cpu", pinned=True)
+
+    def _veto_flips_gpu(self, ids, dv, fg):
+        # Device veto (see Cloth.veto_flips): stage the round's flips and
+        # their group bits through pinned memory, run the kernel over the
+        # sweep's hash grid (still valid: positions are unchanged since the
+        # sweep), read back the first-hit parameter. Returns (keep, tmin).
+        n = len(ids)
+        self._ensure_veto_capacity(n)
+        self.pinIds.numpy()[:n] = ids
+        self.pinDv.numpy()[:n] = dv
+        self.pinGroup.numpy()[:n] = fg
+        wp.copy(self.vetoIds, self.pinIds, count=n)
+        wp.copy(self.vetoDv, self.pinDv, count=n)
+        wp.copy(self.vetoGroup, self.pinGroup, count=n)
+        wp.copy(self.faceGroup, self.pinFaceGroup)
+        self.vetoT.fill_(1.0)
+        # tier 2 (the sweep's big faces, see collect_big_faces, face-centric
+        # against the flips through the vertex -> flip map) on the side
+        # stream, concurrent with the tier-1 walk: both atomic_min into tmin
+        self.flipOf.fill_(-1)
+        wp.launch(kernel=Cloth.scatter_flip_index, dim=n,
+                  inputs=[self.vetoIds], outputs=[self.flipOf])
+        s0 = wp.get_stream()
+        self.sideStream.wait_stream(s0)
+        with wp.ScopedStream(self.sideStream, sync_enter=False):
+            wp.launch(kernel=Cloth.veto_flips_big,
+                      dim=maxBigFaces,
+                      inputs=[self.grid.id, self.pos, self.flipOf, self.vetoDv,
+                              self.vetoGroup, self.faceGroup, self.triIds,
+                              self.crossFaceLongest, self.bigFaceIds, self.bigFaceCount,
+                              float(np.linalg.norm(dv, axis=1).max()) if n else 0.0],
+                      outputs=[self.vetoT])
+        wp.launch(kernel=Cloth.veto_flips,
+                  dim=n,
+                  inputs=[self.grid.id, self.pos, self.vetoIds, self.vetoDv,
+                          self.vetoGroup, self.faceGroup, self.triIds,
+                          self.vertFaceOff, self.vertFaceIds,
+                          self.crossBounds, self.crossReach, self.crossFaceLongest,
+                          float(uncrossSweepL1)],
+                  outputs=[self.vetoT])
+        s0.wait_stream(self.sideStream)
+        wp.copy(self.pinT, self.vetoT, count=n)
+        wp.synchronize_stream()
+        tmin = self.pinT.numpy()[:n].astype(np.float64)
+        return tmin >= 1.0, tmin
+
+    def _veto_flips_vec(self, ids, dv, P, T, fg, face_group):
+        # HOST reference of the no-new-crossing veto (UNCROSS_VETO_GPU=0 /
+        # UNCROSS_VETO_CHECK=1), same policy as Cloth.veto_flips: every face
+        # whose bounding sphere meets the flips' joint bbox (faces with an
+        # edge > edgeLenCap skipped, like the kernel) is a candidate; a
+        # uniform grid over the candidate face spheres pairs each flip with
+        # the faces within half-segment + face radius of its midpoint; the
+        # flip vertex's own faces and the faces carrying one of its group
+        # bits are excluded; one batched Moller-Trumbore over the (flip,
+        # face) pairs. Returns (keep, tmin) -- tmin = smallest hit parameter
+        # (1 = no hit), consumed by the island TOI.
         n = len(ids)
         keep = np.ones(n, dtype=bool)
+        tmin = np.ones(n, dtype=np.float64)
+        P0 = P[ids]
+        P1 = P0 + dv
+        lo = np.minimum(P0, P1).min(axis=0) - 0.03
+        hi = np.maximum(P0, P1).max(axis=0) + 0.03
+        tc = (P[T[:, 0]] + P[T[:, 1]] + P[T[:, 2]]) / 3.0
+        tr = np.maximum(np.linalg.norm(P[T[:, 0]] - tc, axis=1),
+                        np.maximum(np.linalg.norm(P[T[:, 1]] - tc, axis=1),
+                                   np.linalg.norm(P[T[:, 2]] - tc, axis=1)))
+        fl = self.crossFaceLongest.numpy()   # the sweep's per-face longest edge
+        cand = np.nonzero(np.all((tc + tr[:, None] >= lo)
+                                 & (tc - tr[:, None] <= hi), axis=1)
+                          & (fl <= edgeLenCap))[0]
+        if not len(cand):
+            return keep, tmin
         tcc = tc[cand]
         trc = tr[cand]
         smid = P0 + 0.5 * dv
         slen = 0.5 * np.linalg.norm(dv, axis=1)
-        reach = slen + float(trc.max()) + 1e-5          # per-flip search radius
-        cell = float(reach.max()) + 1e-6
-        # uniform grid over the candidate centroids
-        origin = np.minimum(tcc.min(axis=0), smid.min(axis=0)) - cell
-        fk = np.floor((tcc - origin) / cell).astype(np.int64)
-        dims = fk.max(axis=0) + 3
+        # cell >= the longest half-segment: a face sphere that intersects a
+        # flip's sphere then overlaps a cell within the flip's 27-neighborhood
+        # (faces are inserted into EVERY cell their bounding sphere touches,
+        # so the cell no longer scales with the largest stretched face --
+        # that sizing produced 68M candidate pairs per recovery frame)
+        cell = max(float(slen.max()), 0.01) + 1e-6
+        trc3 = np.minimum(trc, 0.2)[:, None]
+        origin = np.minimum((tcc - trc3).min(axis=0), smid.min(axis=0)) - cell
+        lo_k = np.floor((tcc - trc3 - origin) / cell).astype(np.int64)
+        hi_k = np.floor((tcc + trc3 - origin) / cell).astype(np.int64)
+        span = hi_k - lo_k + 1
+        cnt_f = span[:, 0] * span[:, 1] * span[:, 2]
+        tot_f = int(cnt_f.sum())
+        rep_f = np.repeat(np.arange(len(cand)), cnt_f)
+        wf = np.arange(tot_f) - np.repeat(np.cumsum(cnt_f) - cnt_f, cnt_f)
+        sy = span[rep_f, 1]
+        sz = span[rep_f, 2]
+        fk = lo_k[rep_f] + np.stack([wf // (sy * sz), (wf // sz) % sy, wf % sz], axis=1)
+        dims = np.maximum(fk.max(axis=0), np.floor((smid.max(axis=0) - origin) / cell).astype(np.int64)) + 3
         fkey = (fk[:, 0] * dims[1] + fk[:, 1]) * dims[2] + fk[:, 2]
         order = np.argsort(fkey, kind="stable")
         fkey_s = fkey[order]
+        face_of = rep_f[order]
         sk = np.floor((smid - origin) / cell).astype(np.int64)
         offs = np.array([(i, j, l) for i in (-1, 0, 1) for j in (-1, 0, 1)
                          for l in (-1, 0, 1)], dtype=np.int64)
@@ -5564,100 +6674,49 @@ class Cloth(Input):
         cnt = hi_i - lo_i
         tot = int(cnt.sum())
         if tot == 0:
-            return keep
+            return keep, tmin
         # expand the (flip, cell) ranges into (flip, cand-face) pairs
         rep_k = np.repeat(np.arange(n * 27) // 27, cnt)
         starts = np.repeat(lo_i, cnt)
         within = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)
-        pj = order[starts + within]                                  # cand index
-        pk = rep_k
-        # distance filter (identical to the loop's `near`)
+        pj = face_of[starts + within]                                # cand index
+        # a face inserted in several cells can pair with the same flip twice
+        codes0 = np.unique(rep_k.astype(np.int64) * len(cand) + pj)
+        pk = (codes0 // len(cand)).astype(np.int64)
+        pj = (codes0 % len(cand)).astype(np.int64)
+        # distance filter: face centroid within half-segment + face radius
         near = np.linalg.norm(tcc[pj] - smid[pk], axis=1) <= slen[pk] + trc[pj] + 1e-5
-        pk = pk[near]; pj = pj[near]
+        pk = pk[near]
+        pj = pj[near]
         if not len(pk):
-            return keep
-        # exclude the flip vertex's own faces and its allowed set
+            return keep, tmin
+        # exclude the flip vertex's own faces and its allowed set (group bits)
         Tc = T[cand]
         own = (Tc[pj] == ids[pk][:, None]).any(axis=1)
-        pk = pk[~own]; pj = pj[~own]
+        ext = ~own & ((face_group[cand[pj]] & fg[pk]) == 0)
+        pk = pk[ext]
+        pj = pj[ext]
         if not len(pk):
-            return keep
-        nT = T.shape[0]
-        allowed = self._allowed_codes(ids, partners, T, np.unique(pk))
-        if len(allowed):
-            codes = pk.astype(np.int64) * nT + cand[pj].astype(np.int64)
-            ext = ~np.isin(codes, allowed, assume_unique=False)
-            pk = pk[ext]; pj = pj[ext]
-            if not len(pk):
-                return keep
-        # batched Moller-Trumbore, same tolerances as the loop
+            return keep, tmin
+        # batched Moller-Trumbore, same tolerances as the kernel (float32 in)
         A = P[Tc[pj, 0]]
         E1 = P[Tc[pj, 1]] - A
         E2 = P[Tc[pj, 2]] - A
         d = dv[pk]
         h = np.cross(d, E2)
         det = np.einsum('ij,ij->i', E1, h)
-        ok = np.abs(det) > 1e-14
+        ok = np.abs(det) >= 1e-14
         inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
         sv = P0[pk] - A
         u = np.einsum('ij,ij->i', sv, h) * inv
         q = np.cross(sv, E1)
         vpar = np.einsum('ij,ij->i', d, q) * inv
         tpar = np.einsum('ij,ij->i', E2, q) * inv
-        hit = ok & (u >= 0) & (vpar >= 0) & (u + vpar <= 1) & (tpar > 0) & (tpar < 1)
+        hit = ok & (u >= 0) & (u <= 1) & (vpar >= 0) & (u + vpar <= 1) & (tpar > 0) & (tpar < 1)
         if hit.any():
             keep[np.unique(pk[hit])] = False
-        return keep
-
-    def _veto_flips_loop(self, ids, dv, P0, P, T, cand, tc, tr, partners, blocked):
-        keep = np.ones(len(ids), dtype=bool)
-        if len(cand):
-            Tc = T[cand]
-            tcc = tc[cand]
-            trc = tr[cand]
-            A = P[Tc[:, 0]]
-            E1 = P[Tc[:, 1]] - A
-            E2 = P[Tc[:, 2]] - A
-            vfo = self.hostVertFaceOff
-            vfi = self.hostVertFaceIds
-            for k in range(len(ids)):
-                s = int(ids[k])
-                d = dv[k]
-                smid = P0[k] + 0.5 * d
-                slen = 0.5 * np.linalg.norm(d)
-                near = np.linalg.norm(tcc - smid, axis=1) <= slen + trc + 1e-5
-                if not near.any():
-                    continue
-                j = np.nonzero(near)[0]
-                # allowed set: the intended partner faces + their
-                # vertex-adjacent neighbors (same local surface patch)
-                allowed = set()
-                for pf in partners[s]:
-                    allowed.add(pf)
-                    for pv in T[pf]:
-                        allowed.update(
-                            int(x) for x in vfi[vfo[pv]:vfo[pv + 1]])
-                own = (Tc[j] == s).any(axis=1)
-                ext = np.array([int(cand[x]) not in allowed
-                                for x in j], dtype=bool)
-                j = j[~own & ext]
-                if not len(j):
-                    continue
-                h = np.cross(d, E2[j])
-                det = np.einsum('ij,ij->i', E1[j], h)
-                ok = np.abs(det) > 1e-14
-                inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
-                sv = P0[k] - A[j]
-                u = np.einsum('ij,ij->i', sv, h) * inv
-                q = np.cross(sv, E1[j])
-                vpar = np.einsum('j,ij->i', d, q) * inv
-                tpar = np.einsum('ij,ij->i', E2[j], q) * inv
-                hit = ok & (u >= 0) & (vpar >= 0) & (u + vpar <= 1) \
-                    & (tpar > 0) & (tpar < 1)
-                if hit.any():
-                    keep[k] = False
-                    blocked.add(s)
-        return keep
+            np.minimum.at(tmin, pk[hit], tpar[hit].astype(np.float64))
+        return keep, tmin
 
     def simulate(self, steps=numSubsteps, iterations=numIterations, integrate=True, self_collision=True, solve_constraints=True):
         dt = timeStep / numSubsteps
@@ -5676,6 +6735,11 @@ class Cloth(Input):
                      and sphere.dc[2] == 0.0 and sphere.dr == 0.0)
         self._uncrossFrame = getattr(self, "_uncrossFrame", 0) + 1
         recovery_found = 0  # this frame's quiescent sweep count (interleave gate)
+        self._uncrossSpent = 0.0   # this frame's resolver wall time (see uncrossBudgetMs)
+        self._uncrossBudget = None
+        if _UNCROSS_PROF:
+            self._uncrossProf = {}
+            _prof_t0 = time.perf_counter()
         if uncrossEnable and self_collision:
             # Idle backoff: a clean sweep costs ~3.5 ms/frame at 400x400 (grid
             # build + per-edge walk + sync) and a settled scene stays clean,
@@ -5683,12 +6747,14 @@ class Cloth(Input):
             # any hit (or an interaction ending) restores full rate.
             skip = getattr(self, "_uncrossSkip", 0)
             if quiescent or not uncrossGated:
-                if skip > 0:
+                if skip > 0 and quiescent:
+                    # (no idle backoff under interaction: a free-grip plow
+                    # forms ~300 crossings in the 2 skipped frames)
                     self._uncrossSkip = skip - 1
                 else:
                     found = recovery_found = self._resolve_crossings()
                     back = getattr(self, "_uncrossBackoff", 0)
-                    if found == 0:
+                    if found == 0 and quiescent:
                         self._uncrossBackoff = min(max(back, 1) * 2, 4)
                         self._uncrossSkip = self._uncrossBackoff - 1
                     else:
@@ -5704,7 +6770,8 @@ class Cloth(Input):
                                         mask=self._uncross_mask())
                 self._uncrossSkip = 0
                 self._uncrossBackoff = 0
-            elif (uncrossDrag and grabBrakeK > 0.0 and self.activeGrabs
+            elif (uncrossDrag and (grabBrakeK > 0.0 or uncrossDragFull)
+                    and self.activeGrabs
                     and getattr(self, "_lastCrossTotal", 0) > 0
                     and self._uncrossFrame % uncrossDragEvery == 0):
                 # In-drag resolution (see UNCROSS_DRAG): fires only while the
@@ -5712,8 +6779,18 @@ class Cloth(Input):
                 # grab, i.e. exactly when the anchor is throttled -- the brake
                 # holds creation below the resolver's drain rate (in-drag
                 # resolution WITHOUT the brake loses to the plow's creation
-                # rate; measured 96->745).
-                self._resolve_crossings(max_n=uncrossForcedMaxN)
+                # rate; measured 96->745 with the LEGACY resolver).
+                # UNCROSS_DRAG_FULL=1 (2026-09, contour resolver): run the
+                # full recovery machinery (burst rounds + settle-interleave)
+                # in-drag and allow it with the brake OFF -- measured on the
+                # recorded 400^2 session with a FREE grip: worst 328 at
+                # onset, cleared in 6 frames, 0 for the last ~80 drag
+                # frames, created < removed every frame, full drag authority
+                # (3.15 m vs 3.26 m unresolved).
+                if uncrossDragFull:
+                    found = recovery_found = self._resolve_crossings()
+                else:
+                    self._resolve_crossings(max_n=uncrossForcedMaxN)
                 self._uncrossSkip = 0
                 self._uncrossBackoff = 0
 
@@ -5728,19 +6805,7 @@ class Cloth(Input):
         self._crossSwept = ((flagGuardEnable or grabBrakeK > 0.0)
                             and self_collision and bool(self.activeGrabs))
         if self._crossSwept:
-            self.grid.build(self.pos, gridCellSize)
-            self.crossBounds.zero_()
-            wp.launch(kernel=Cloth.max_edge_length,
-                      dim=boundsReduceThreads,
-                      inputs=[self.pos, self.edgeIds],
-                      outputs=[self.crossBounds])
-            self.crossCount.zero_()
-            wp.launch(kernel=Cloth.detect_crossings,
-                      dim=self.numEdges,
-                      inputs=[self.grid.id, self.pos, self.edgeIds, self.triIds,
-                              self.gridRC, self.vertFaceOff, self.vertFaceIds,
-                              self.crossBounds],
-                      outputs=[self.crossPairs, self.crossCount])
+            self._sweep_crossings()
             self.crossedFlag.zero_()
             wp.launch(kernel=Cloth.scatter_crossed_flags,
                       dim=maxCross,
@@ -5842,11 +6907,23 @@ class Cloth(Input):
                 for _ in range(cnt):
                     wp.capture_launch(graph)
                 done += cnt
-                if done < steps:
+                if done < steps and not self._uncross_over_budget():
                     self._resolve_crossings()
         else:
             for _ in range(steps):
                 wp.capture_launch(graph)
+
+        if _UNCROSS_PROF:
+            wp.synchronize_device()
+            pr = self._uncrossProf
+            tot = time.perf_counter() - _prof_t0
+            _cnt = ("passes", "rounds", "flips")
+            res = sum(v for k, v in pr.items() if k not in _cnt and k != "sim.wait")
+            print(f"[uncross-prof] frame={tot*1e3:.0f}ms resolver={res*1e3:.0f}ms "
+                  f"sim~{(tot-res)*1e3:.0f}ms passes={pr.get('passes', 0)} "
+                  f"rounds={pr.get('rounds', 0)} flips={pr.get('flips', 0)} | "
+                  + " ".join(f"{k}={v*1e3:.0f}" for k, v in sorted(pr.items())
+                             if k not in _cnt and k != "sim.wait"), flush=True)
 
         wp.copy(self.hostPos, self.pos)
         # hostPos is a PINNED cpu array, so the D2H copy above is issued as an
@@ -5875,11 +6952,16 @@ class Cloth(Input):
         # update_anchors.
         self.crossNearHost = {}
         self._lastCrossTotal = 0
-        if getattr(self, "_crossSwept", False) and grabBrakeK > 0.0 \
-                and self.activeGrabs:
+        if getattr(self, "_crossSwept", False) \
+                and (grabBrakeK > 0.0 or uncrossDragFull) and self.activeGrabs:
             n_cross = int(self.crossCount.numpy()[0])
             self._lastCrossTotal = n_cross
-            if n_cross > 0:
+            if int(self.bigFaceCount.numpy()[0]) > maxBigFaces \
+                    and not getattr(self, "_bigFaceWarned", False):
+                self._bigFaceWarned = True
+                print("[uncross] in-drag sweep: tier-2 face list overflowed "
+                      f"(> {maxBigFaces}); brake count may be low", flush=True)
+            if n_cross > 0 and grabBrakeK > 0.0:
                 pairs = self.crossPairs.numpy()[:min(n_cross, maxCross)]
                 P = self.hostPos.numpy()
                 mids = 0.5 * (P[self.hostEdgeIds[pairs[:, 0], 0]]
