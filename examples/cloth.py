@@ -68,6 +68,7 @@ Trackpad Controls
 import argparse
 import ctypes
 import glob
+import json
 import os
 import math
 import stat
@@ -125,9 +126,11 @@ gravity = wp.vec3(0.0, -9.80665, 0.0)
 
 thickness = 0.001
 particleRadius = 0.0045
-fingerRadius = 0.06     # world radius of a touch/click grab: all cloth particles
+fingerRadius = 0.08     # world radius of a touch/click grab: all cloth particles
                         # within this distance of the picked point are pinned and
                         # dragged together (see Particle.group / drag_anchor)
+maxGrabs = 8            # simultaneous grab anchors swept per substep in-graph
+maxGrabMembers = 4096   # total pinned patch particles across all grabs
 maxVelocity = 1e2   # m/s cap on cloth particle velocity (spike guard)
 
 # Stability / broadphase-safety bounds (see the collision audit).
@@ -155,6 +158,719 @@ gamma_r = 0.9                    # conservative truncation safety ratio (Newton 
 # stuck"). Capping to a fraction of d_offset bounds the per-substep separation
 # (overlaps still relax over several of the 60 substeps) and the injected velocity.
 pushClamp = 0.5 * d_offset
+
+# --- Stack-aware grab shell clamp (sliding a folded stack on the sphere) ---
+# The anchor-out-of-sphere clamp keeps a grab's target at bare shell contact
+# distance (radius + thickness + particleRadius), which is only right when the
+# grabbed fabric sits DIRECTLY on the shell. Grabbing the TOP of a folded
+# stack lying on the sphere and dragging it across (the user's "penetration
+# while sliding with multiple folds") pressed the pinned patch to bare-shell
+# distance with 1-3 free layers trapped beneath -- squeezed between two hard
+# constraints into transient violation bursts (60-250) and sphere penetration.
+# ANCHOR_STACK lifts the clamp each frame by the measured free-stack height in
+# the patch's shadow column (90th percentile shell distance + d_offset,
+# capped), so the drag slides the top layer OVER the trapped fabric.
+anchorStack = int(os.environ.get("ANCHOR_STACK", "1") not in ("0", "", "false"))
+anchorStackCap = float(os.environ.get("ANCHOR_STACK_CAP", str(12.0 * d_offset)))
+# Per-frame cap on the STACK-driven outward motion of the anchor/member clamp
+# (the bare-shell recovery stays geometric -- it must ride an advancing
+# shell). A stack detection can appear within one frame (fold flops under the
+# patch); an unlimited lift then yanks the pinned patch outward by up to the
+# full cap in one frame, plowing it into whatever rests on top (measured as
+# occasional 50-90-violation air-pinch bursts + flip spikes with the
+# unlimited lift). 2*d_offset/frame still clears a forming stack in 2-6
+# frames, faster than the squeeze can lock. The DECAY is slower still: the
+# clamp is a min bound the commanded target presses against, so a fast decay
+# lets the measurement flicker (percentile of a churning candidate set) drive
+# a rise-lag/instant-drop sawtooth around the stack top -- measured as
+# sustained 6-9-sample viol 10-40 squeeze streaks. Both are per-frame limits
+# on the SMOOTHED LIFT STATE stored on the anchor, not on the target motion.
+anchorLiftStep = float(os.environ.get("ANCHOR_LIFT_STEP", str(2.0 * d_offset)))
+anchorLiftDecay = float(os.environ.get("ANCHOR_LIFT_DECAY", str(0.5 * d_offset)))
+# Stage the FULL member sphere push-out into the frame's pinned offsets (the
+# stored conform blend stays half-folded): without it, members lag the shell
+# by several frames while the anchor approaches and park INSIDE the sphere.
+grabConformFull = int(os.environ.get("GRAB_CONFORM_FULL", "1") not in ("0", "", "false"))
+
+# --- Load-yielding grip ---
+# A pinned grab patch is otherwise an infinitely strong actuator: it plows
+# through layered fabric regardless of resistance, and sustained forcing beyond
+# the pushClamp-capped recovery bandwidth is the dominant entanglement driver
+# (once sheets cross, the C<0 push acts on the wrong side and locks the knot).
+# The narrowphase C<0 branches record the separation share an inv_mass==0
+# (grabbed) vertex WOULD have taken into its push[] slot (sim-inert: apply_
+# truncation skips pinned vertices) as a PRESSURE SIGNAL. simulate() sums it
+# per grab over the frame's substeps; update_anchors then yields the grip
+# under load, one frame later:
+#   STALL  -- scale the advance toward the pointer by
+#             1 / (1 + grabYieldStallK * mean_member_pressure / d_offset):
+#             the grip lags under load and catches up when the load clears
+#             (a finger cannot force cloth through cloth).
+#   RETREAT - back the anchor off along the net pressure direction by
+#             grabYieldGain * (frame pressure sum / members), capped at the
+#             per-frame advance limit so the grip goes mushy, never detaches.
+grabYieldStallK = float(os.environ.get("GRAB_YIELD_STALL_K", "8.0"))
+grabYieldGain = float(os.environ.get("GRAB_YIELD_GAIN", "1.0"))
+# STALL FLOOR -- minimum drag authority. The raw stall 1/(1+K*m/d_offset) has
+# no lower bound: a settled fold squeezed between the grab and the sphere
+# holds a STEADY mean member pressure (~0.5-0.8*d_offset measured on
+# cross-flank drags), so the scale parks at ~0.15 indefinitely and the drag
+# feels dead (the user's "dragging one side into the other is impossible").
+# A real finger keeps moving -- the pile bunches and gives way. Guarantee a
+# minimum advance fraction: scale = max(floor, 1/(1+K*m)). Safe because the
+# per-frame speed clamp (0.45*d_offset/substep) already caps even full-speed
+# plowing just under the fabric's per-substep yield capacity (pushClamp
+# 0.5*d_offset); the stall's entanglement protection is about damping
+# SUSTAINED forcing, and the floor value below was fuzz-validated (36-session
+# all-family sweep + historic knot-seed replays not worse than the unfloored
+# baseline).
+# Floor raised 0.3 -> 0.4 once the fingertip collider took over guarding the
+# actual crossing site (the stall's protective role shrank; the user read the
+# friction-loaded stall as "the drag does not get enough force").
+grabYieldMinScale = float(os.environ.get("GRAB_YIELD_MIN_SCALE", "0.4"))
+# PRESSURE-BUDGET STALL -- stall on the TRANSIENT part of the pressure.
+# m_eff = max(0, m_now - beta*ema(m)): a steady parked-contact pressure (the
+# freeze regime) is progressively discounted, so a steady plow converges to
+# authority 1/(1+K*(1-beta)*m/d_offset) (>= the floor), while a sharp NEW
+# spike (a knot forming) still brakes at full strength because the EMA lags
+# it. beta=0 disables (raw pressure, historic behavior).
+grabYieldSustainBeta = float(os.environ.get("GRAB_YIELD_SUSTAIN_BETA", "0.0"))
+# EMA rate per frame for the sustained-pressure tracker (only used when
+# beta > 0). Slower rate = longer "burst grace" before a sustained load is
+# discounted.
+grabYieldSustainEma = float(os.environ.get("GRAB_YIELD_SUSTAIN_EMA", "0.25"))
+# Shape of the floored stall: saturating (floor + (1-floor)/(1+K*m), default --
+# the scan winner "S30": authority 0.57-0.63 during fold contact with zero
+# post-violations) vs a hard clip (max(scale, floor)).
+grabYieldSat = os.environ.get("GRAB_YIELD_SAT", "1") not in ("0", "", "false")
+# PRE-CONTACT pressure (compile-time kernel constant): also record, in the
+# c >= 0 truncation branches, how far a pinned vertex's substep displacement
+# would OVERSHOOT the shared separating plane (the share truncation cannot
+# deliver to it). This fires while the pair still has a positive gap -- before
+# any violation exists -- so the grip yields before sheets cross rather than
+# reacting to an already-locked knot.
+GRAB_YIELD_PRECONTACT = wp.constant(
+    1 if os.environ.get("GRAB_YIELD_PRECONTACT", "1") not in ("0", "", "false") else 0)
+# DIRECTION-AWARE yield: pressure MAGNITUDE alone cannot tell extraction
+# (pulling a grabbed corner OUT of a pile squeezes the members and reads as
+# load, but moves WITH the direction the contacts push them -- relieving)
+# from plowing (advancing AGAINST that push, forcing fabric through fabric).
+# With this flag on, the advance component ALONG the net member-push
+# direction (pvec) bypasses the stall (see update_anchors for the exact
+# split). DEFAULT OFF after adversarial validation: pvec's sign is only
+# trustworthy BEFORE sheets cross -- once a crossing exists the c<0 recovery
+# push acts on the wrong side (see the entanglement-study notes), pvec flips
+# INTO the drag direction, and the bypass feeds the locked knot at full
+# speed (fuzz seed 3009: 0/4 baseline fails -> 4/4 with the bypass, clean
+# again with it off). The magnitude-blind stall is load-bearing exactly
+# because it also brakes post-crossing forcing. Kept behind the env knob
+# for app-side A/B.
+grabYieldDirectional = os.environ.get("GRAB_YIELD_DIRECTIONAL", "0") not in ("0", "", "false")
+# EMA factor for the retreat term (1.0 = raw/no smoothing). See update_anchors.
+grabYieldRetreatEma = float(os.environ.get("GRAB_YIELD_RETREAT_EMA", "0.3"))
+grabYieldDirCoherence = float(os.environ.get("GRAB_YIELD_DIR_COHERENCE", "0.25"))
+# Fingertip-tolerant picking: the pixel ray is infinitesimal, so a press on
+# the visible EDGE of fabric (the corner of a floor pile -- exactly what a
+# user grabs to flatten it) can graze past every triangle by a couple of
+# millimeters and return no anchor ("the drag is inoperant"). When the ray
+# hits nothing (or only claimed vertices), fall back to the frontmost
+# unclaimed particle within fingerRadius of the ray -- what the finger pad
+# would actually touch.
+grabPickTolerant = os.environ.get("GRAB_PICK_TOLERANT", "1") not in ("0", "", "false")
+# Session recorder: CLOTH_RECORD=/path.jsonl makes update_anchors append one
+# JSON line per frame with every active anchor's control inputs (screen point,
+# the exact pointer ray, committed target, depth) plus the sphere pose --
+# everything needed to REPLAY a live app session bit-faithfully in the
+# headless harness (cloth_drag_fuzz.py --replay-app FILE) and probe it with
+# the exact-crossing instruments. Near-zero overhead when unset.
+# Fingertip collider: the grab patch is pinned (inv_mass 0) and therefore a
+# HOLE in the collision response -- no projection pass can move it, so fabric
+# pinched between the patch and any backing (shell, fold, taut sheet) has one
+# escape route: THROUGH the patch. Proven by exact crossing probes on recorded
+# sessions: crossings during cross-flank drags concentrate 100% within a patch
+# radius of the anchor. Treat each active grab as a small kinematic sphere:
+# free vertices are projected out of the fingertip ball every substep
+# (velocity-bounded like the collider passes), so fabric flows AROUND the grip
+# the way it flows around the ball -- members are inv_mass 0 and unaffected.
+FINGER_COLLIDER = wp.constant(
+    1 if os.environ.get("FINGER_COLLIDER", "1") not in ("0", "", "false") else 0)
+# Default 0.7 (was 1.15) since GRAB_EVADE landed: at 0.7 the ball (0.042 m) is
+# SMALLER than the patch itself (fingerRadius 0.06), so it no longer sticks
+# out past the patch outline shoving fabric into the visible "bulb" ring --
+# it survives as an onset-recovery volume under the patch skirt (fabric
+# already inside the grip at grab time, and locked clusters the pair-exact
+# evasion cannot undo), while the evasion handles the pre-contact geometry at
+# the patch fringe exactly. Measured (12-rep replay-app pools, worst-during
+# exact crossings): ball 1.15 alone median 12.5 / max 183; evade + 0.7 ball
+# median 12 / max 46 -- the grip-closure burst class (79, 183) disappeared.
+# Layered-fold gentle slides: the 1.15 ball's own eviction pumped crossings
+# (median 7.5, max 105 exact crossings; 3*projClamp bounded eviction can
+# cross a sheet closer than the step); 0.7+evade measured median 0 / max 27,
+# with the grip-annulus bulge ridge down 38% (0.043 -> 0.0265).
+fingerColliderR = float(os.environ.get("FINGER_COLLIDER_R", "0.7"))  # x fingerRadius
+# Eviction speed inside the ball, x projClamp. The grip CLOSES on fabric that
+# is already deep inside the volume; at 1x it takes ~20 substeps to clear and
+# crossings form in the onset window. Inside the ball everything is being
+# co-evicted, so a faster bound is low-risk there.
+fingerColliderPush = float(os.environ.get("FINGER_COLLIDER_PUSH", "3.0"))
+# Swept CCD for the fingertip ball (always a true sphere, independent of
+# COLLIDER_KIND): at the cloth's stretch limit a taut sheet cannot comply with
+# the bounded eviction, and the ball dragged into it crosses WITHIN a substep
+# -- the user's "keep dragging until it stretches, then it penetrates". The
+# analytic time-of-impact catches that regardless of drag speed.
+FINGER_CCD = wp.constant(
+    1 if os.environ.get("FINGER_CCD", "1") not in ("0", "", "false") else 0)
+# CCD radius, x fingerRadius, independent of the volumetric radius above: the
+# CCD term only fires on substep trajectories that ENTER the ball from
+# outside (fabric already inside is untouched), so it contributes no
+# steady-state bulb and can afford more coverage than the eviction volume.
+# Kept at the original 1.15 when the volumetric ball shrank to 0.7: the taut
+# stretch-limit sheet is exactly the CCD case (it cannot comply with bounded
+# eviction, so the grip crosses it within a substep), and shrinking the CCD
+# with the ball re-opened it -- stretch_drag worst crossings 27 (ball 1.15)
+# -> 101 (everything at 0.7) -> 26 with CCD back at 1.15, post residue 18 -> 0.
+fingerCcdR = float(os.environ.get("FINGER_CCD_R", "1.15"))
+# Anticipatory evasion push: the narrowphase pre-contact branches (see
+# GRAB_YIELD_PRECONTACT, which must be on for this to fire) already compute,
+# PER PAIR, exactly how far a pinned member's substep displacement overshoots
+# the shared separating plane -- the share truncation cannot deliver to it.
+# Today that overshoot is only RECORDED as grip pressure; with this flag the
+# FREE side of the pair also receives it as an immediate evasion displacement
+# along the separation direction (accumulated into push[], so it rides
+# apply_truncation's pushClamp bound and floor/shell invariants): the patch
+# pushes fabric out of its own path through the exact pair geometry, the same
+# reassignment philosophy as the c<0 lmbd=0 rule. Unlike the fingertip ball
+# there is no guard volume, so no "bulb" -- fabric is displaced only by the
+# amount the member actually invades, only while it approaches (the overshoot
+# is gated on approach speed by construction: resting contacts have ~zero
+# displacement and produce ~zero overshoot).
+# Consumer choice (push[] vs deltas): push is reset by clamp_displacement,
+# written only by the narrowphase, and applied EXACTLY ONCE in
+# apply_truncation immediately after the truncation -- the evasion lands in
+# the same substep the overshoot occurs, before the collider passes final-say
+# and before update_velocity bakes it into vel. deltas written here would sit
+# until the first add_deltas INSIDE the collider-edge-pass loop (after
+# apply_truncation and collider_project), arriving late and mixed into the
+# edge-collider Jacobi step. push also brings the right clamps for free:
+# pushClamp (0.5*d_offset) bounds the TOTAL of evasion + c<0 recovery per
+# vertex per substep (the recovery-bandwidth bound the entanglement design is
+# built on -- and >= the grab speed clamp 0.45*d_offset/substep, so evasion
+# can keep pace with the fastest patch), and the floor/shell invariants keep
+# an evasion against a backing from being teleported through the ground or
+# into the sphere (the inward component is cancelled -> the push turns into
+# the lateral escape a plow should produce).
+# No double count: a pair is EITHER pre-contact (c >= 0, evasion) or
+# overlapping (c < 0, recovery push) in a given substep. Across the two EE
+# discovery directions, each thread writes evasion only to its OWN free
+# endpoints from the CANDIDATE side's pinned overshoot (the mirrored thread,
+# if any, owns the other side; a fully pinned own edge early-outs and its
+# free counterpart delivers) -- the same own-endpoint-only convention that
+# keeps the c<0 push single-counted.
+GRAB_EVADE = wp.constant(
+    1 if os.environ.get("GRAB_EVADE", "1") not in ("0", "", "false") else 0)
+grabEvadeGain = float(os.environ.get("GRAB_EVADE_GAIN", "1.0"))
+# --- Far free-free crossing guard (the valley-plow "burst" class) ---
+# Per-substep attribution of the plow-front bursts (free-free pairs at grid
+# ring > 3 crossing in a single frame) showed every burst pair WAS in the
+# detection caches and ALREADY inside d_offset at the frozen reference
+# (c < 0) -- and the c<0 recovery branch skips the truncation plane entirely,
+# so nothing constrains motion across the REMAINING gap d: the crossing is
+# then completed by whichever bounded mover fires next (measured mix: the
+# fingertip eviction step 3*projClamp > gap, the net c<0 push composition in
+# a 3+ layer squeeze where opposing-neighbor pushes close the middle pair,
+# the collider passes, or a repulsion/pinch delta the skipped plane never
+# vetoed). Two cooperating pieces, both env-gated here:
+#  * BARRIER PLANE: in the c<0 branches, additionally truncate every free
+#    vertex's displacement against the remaining-gap split plane
+#    (cp + lmbd*d*n): the pair may stay pressed but the frozen surfaces
+#    cannot pass each other via truncated displacement this substep. The
+#    recovery push still rides on top exactly as before.
+#  * CROSSING BUDGET (push_limit): every narrowphase pair also atomic_min's
+#    a per-vertex budget kappa*d (kappa < 0.5, so the two sides' budgets sum
+#    below the remaining gap). apply_truncation clamps the recovery push to
+#    it (a net push composed across pairs can no longer close the tightest
+#    pair) and hands the LEFTOVER to fingertip_project, whose volumetric
+#    eviction step is capped by it (an eviction can no longer step across a
+#    sheet closer than 3*projClamp). Vertices with no near pair keep an
+#    unbounded budget -- onset grip clearance is unaffected. The fingertip
+#    CCD branch is deliberately NOT capped (taut-sheet anti-tunnel).
+FAR_GUARD = wp.constant(
+    1 if os.environ.get("FAR_GUARD", "1") not in ("0", "", "false") else 0)
+# Whether the crossing budget also CAPS the c<0 recovery push (it always
+# decrements for the fingertip cap). See the apply_truncation note.
+FAR_BUDGET_PUSH = wp.constant(
+    1 if os.environ.get("FAR_BUDGET_PUSH", "1") not in ("0", "", "false") else 0)
+farGuardKappa = float(os.environ.get("FAR_GUARD_KAPPA", "0.45"))
+# Barrier floor (x d_offset): the barrier plane is SIDE-BLIND -- for a pair
+# that has ALREADY crossed (via a mover outside PDT jurisdiction), the frozen
+# "gap" d is the wrong-side depth and the barrier would truncate the RETURN
+# motion, locking the crossing in place (measured: a growing, post-release-
+# persistent ring-2/3 crossing band in one plow rep -- a failure class the
+# baseline never shows; the same side-blindness critique as ring_floor).
+# Crossed pairs sit at |gap| ~ 0 while burst creations complete from
+# 0.4-1.0 x d_offset (attribution: median 0.72, only ~10% below 0.25), so a
+# small floor keeps the prevention and lets crossed pairs slide back out.
+farBarrierFloor = float(os.environ.get("FAR_BARRIER_FLOOR", "0.25"))
+# --- Crossed-flag guard + crossing brake (400^2 plow-density fix) ---
+# At the user's real 400x400 the plow front packs ~2x the layer density of the
+# 200x200 tuning scenes: pairs get pressed BELOW the side-blind barrier floor
+# above before they cross, and once sub-floor NOTHING constrains them. Exact
+# per-substep mover attribution on the recorded 400^2 session (replay-app
+# f138-206 with intra-substep phase snapshots, one locked rep, ~26k creation
+# events): the post-PDT collider/strain/ring-floor block completes 56% of all
+# crossing creations (col/ff/far alone 46%), pre-narrowphase displacement
+# (solve + anchor sweep) ~18%, the recovery-push/evade composition riding over
+# the planes ~17%, repulsion ~8%, fingertip eviction ~1% -- so the nx=200
+# levers (floored push budget, eviction cap) do not even see the dominant
+# 400^2 movers. Two cooperating pieces, both grab-gated (grab-free scenes are
+# bit-identical, and the sphere/crush machinery is untouched):
+#  * FLAG_GUARD: once per frame while a grab is active, run the resolver's
+#    EXACT crossing sweep (detect_crossings; no host readback -- a device
+#    scatter marks the involved vertices in crossedFlag). The c<0 barrier
+#    floor becomes side-AWARE: a pair with NO flagged vertex is genuinely
+#    uncrossed, so it gets the barrier all the way down to FAR_BARRIER_EPS
+#    (sub-floor gaps protected); a flagged pair keeps the legacy blind floor
+#    so return motion stays free (the lock hazard the 0.25 floor existed
+#    for). Flags lag one frame: a pair crossing mid-frame is barrier-held for
+#    the remaining substeps, then flagged and freed.
+#  * GRAB_BRAKE: exact-topology negative feedback on the FORCING. The same
+#    per-frame sweep hands update_anchors each grab's near-anchor crossing
+#    count; while crossings exist at the plow front, the anchor advance is
+#    scaled down by 1/(1 + K*n) (own floor, below the yield stall's authority
+#    floor -- an actual crossing is fabric ripping through fabric, braking
+#    then is correct, unambiguous, and self-releasing: the count decays as
+#    the recovery machinery clears the front, and the brake vanishes with
+#    it). Baseline 400^2 dynamics motivate this: crossings self-cleared to 0
+#    MID-DRAG whenever formation paused, and every locked ending grew out of
+#    a sustained-plow phase where formation outran the pushClamp-bounded
+#    recovery -- the mover, not the guards, sets the failure rate at this
+#    density.
+# MEASURED NEGATIVE at 400^2 (removed; kept as a warning): an end-of-substep
+# truncation-only plane re-pass (re-applying the frozen planes to the NET
+# displacement after the collider/strain block, to veto the post-PDT movers
+# that complete 74% of the crossings) makes things ~3x WORSE (worst 514-518
+# vs baseline 106-694 median ~150, flips 20-40 -> 90-116, locked endings):
+# planar truncation cancels the WHOLE displacement vector of a grazing
+# contact (t ~ 0 at resting gaps), so the re-pass fights the strain-limiter
+# and collider convergence work every substep and the pile's geometry
+# quality collapses. Do not re-add a net-displacement plane re-pass.
+FLAG_GUARD = wp.constant(
+    1 if os.environ.get("FLAG_GUARD", "1") not in ("0", "", "false") else 0)
+flagGuardEnable = int(os.environ.get("FLAG_GUARD", "1") not in ("0", "", "false"))
+farBarrierEps = float(os.environ.get("FAR_BARRIER_EPS", "0.02"))
+grabBrakeK = float(os.environ.get("GRAB_BRAKE_K", "1.0"))
+grabBrakeFloor = float(os.environ.get("GRAB_BRAKE_FLOOR", "0.05"))
+grabBrakeR = float(os.environ.get("GRAB_BRAKE_R", "0.3"))
+# Brake hysteresis: the raw count releases the brake the instant a wad
+# resolves, and the anchor then rams the still-compressed pile at full
+# authority -- measured as a resolve/ram limit cycle with GROWING re-bursts
+# (worst 70-115 -> 134-159 when in-drag resolution cleared wads instantly).
+# Peak-hold with exponential decay: authority returns over ~15-20 frames
+# after the front clears, giving the pile time to decompress.
+grabBrakeDecay = float(os.environ.get("GRAB_BRAKE_DECAY", "0.85"))
+# Onset pre-arm: initial brake hold at grab creation (see drag_anchor).
+# 12 means first-frame authority ~1/(1+K*12*0.85) ~ 0.09, back above 0.5 by
+# ~13 frames, fully free by ~20 -- unless the sweep starts reporting crossings,
+# in which case the count takes over. Set 0 to disable.
+grabBrakeOnset = float(os.environ.get("GRAB_BRAKE_ONSET", "12"))
+# In-drag resolution (UNCROSS_DRAG): the quiescent-only resolver leaves every
+# crossing formed during a 60-frame drag to accumulate until release -- at
+# 400^2 the release-time wad is then 100s of pairs and the cluster vote locks
+# ~half the time. The historical reason for quiescent-only (30 substeps of
+# plow re-cross whatever one host pass uncrosses, churning the pile) is
+# neutralized by the crossing brake: while crossings exist near the grab the
+# anchor is throttled to ~grabBrakeFloor, so the local state is quasi-
+# quiescent and resolution sticks. Gated on the brake's own signal (last
+# sweep found crossings, a grab is active), every UNCROSS_DRAG_EVERY frames.
+uncrossDrag = int(os.environ.get("UNCROSS_DRAG", "1") not in ("0", "", "false"))
+uncrossDragEvery = int(os.environ.get("UNCROSS_DRAG_EVERY", "2"))
+# Staged-patch self-crossing veto (see _patch_self_crossed): valley-plow
+# attribution showed the dominant in-drag crossing bursts are the patch RIM
+# crossing itself/its skirt (memE1-2 x memF1-3, all ring<=2) -- the per-frame
+# conform push-outs scramble the member offsets into a self-crossed shape
+# that no runtime mechanism can repair (PDT ring-culls it, members are
+# pinned). Veto the staged shape instead.
+grabVeto = os.environ.get("GRAB_VETO", "1") not in ("0", "", "false")
+clothRecordPath = os.environ.get("CLOTH_RECORD", "")
+_clothRecordFile = open(clothRecordPath, "a") if clothRecordPath else None
+# Sliding grab: when the committed anchor target chronically lags the
+# commanded pointer-ray target (yield stall against a snagged patch, or any
+# obstruction), the grip slips over the fabric like a fingertip: release the
+# current members, re-grab a fingertip patch one step toward the pointer, and
+# continue the stroke seamlessly (see Cloth._slide_grab).
+# Default OFF: in app testing the re-grab produced visible artifacts (the
+# grip hopping to neighbor vertices reads as a snap); the stack-aware shell
+# clamp turned out to be the fix that mattered for folded slides. Set
+# GRAB_SLIDE=1 to re-enable for A/B.
+grabSlide = os.environ.get("GRAB_SLIDE", "0") not in ("0", "", "false")
+grabSlideLag = float(os.environ.get("GRAB_SLIDE_LAG_R", "2.0")) * fingerRadius
+grabSlideFrames = int(os.environ.get("GRAB_SLIDE_FRAMES", "4"))
+grabSlideStep = float(os.environ.get("GRAB_SLIDE_STEP_R", "1.0")) * fingerRadius
+# Ground-following drag target: with the camera above the ground the depth
+# rule only ever DECREASED the anchor depth, so dragging fabric that lies ON
+# the floor AWAY from the camera left the target hovering at the grab depth
+# (far-side floor drags traveled ~1/3 of the commanded distance). While the
+# grabbed fabric is at floor level, let the target follow the RECEDING ground
+# intersection too (see update_anchors).
+grabGroundFollow = os.environ.get("GRAB_GROUND_FOLLOW", "1") not in ("0", "", "false")
+grabGroundBand = 5.0 * d_offset  # "at floor level" tolerance for the rule above
+# The same bound applied to every HARD projection (sphere pass-2 ejection, the
+# edge-vs-sphere passes, the ground snap): an unbounded projection is a teleport
+# that can carry fabric THROUGH a neighboring sheet in one substep -- measured as
+# entangled knots forming exactly on the sphere's contact shell when dragged
+# fabric squeezes resting fabric into the sphere (the collider ejected it back
+# out through the dragged sheet; PDT never saw the motion). Velocity-bounded
+# projections keep every subsystem's motion visible to the PDT planes; collider
+# penetration under squeeze becomes a small bounded transient instead.
+projClamp = 0.5 * d_offset
+
+# --- Pile-crush floor invariant + pinch-corridor extrusion ---
+# The ground gets exactly ONE velocity-bounded (projClamp) correction per
+# substep (in collider_project), while its opponents during a sphere-onto-pile
+# crush -- multi-pair repulsion sums, the PDT recovery push, strain/ring-floor
+# deltas, the 11 edge-collider passes -- are each separately capped and all
+# APPLIED THROUGH add_deltas / apply_truncation with no floor awareness. Under
+# an overfull pinch (a ~1.0-radius sphere parked at its floor clamp over a
+# 5-layer pile) the bottom layers lose that fight and are expelled BELOW the
+# floor (measured: ~1100 particles at y down to -0.044, persisting through the
+# whole settle), crossing every layer on the way -- the permanent-entanglement
+# highway. The floor is therefore a hard feasibility bound for INTERNAL
+# displacement writers: add_deltas and apply_truncation refuse to move a
+# particle from above the particle floor (y = thickness) to below it, and
+# refuse to push an already-below particle deeper. Only integrate (gravity)
+# may dip below, and the ground pass recovers it as before.
+#
+# Preventing the floor crossing still leaves the pinch wedge overfull (honest
+# squeeze violations; every contact normal there is near-vertical, so nothing
+# transports fabric sideways). Three cooperating pieces add the missing
+# tangential escape, all gated on REAL local stacking pressure (this substep's
+# cached vtCount; a lone sheet scores ~0, 2+ pressed layers ~12+):
+#  * pinch_extrude -- while the wedge is CLOSING (shell descending, growing,
+#    or parked at its floor clamp), free particles in a radial band around
+#    the lower shell surface get a bounded horizontal step away from the
+#    sphere axis, out of the wedge. Runs BEFORE the truncation narrowphase
+#    (via deltas, like the repulsion) so the PDT planes veto any step that
+#    would cross another sheet -- fabric stops at fold walls instead of being
+#    teleported through them.
+#  * collider_project pass 2 / collider_project_edges -- a mostly-DOWNWARD
+#    radial ejection of shallowly-penetrating fabric (the band the descending
+#    shell "eats" each substep) is redirected to the lateral shell exit at
+#    the particle's own height: parallel to the pancaked sheets below, so the
+#    ejection cannot cross them. Deep penetrations keep the radial route so
+#    sphere non-penetration always converges.
+#  * apply_truncation -- the c<0 recovery push may not drive a particle
+#    deeper INTO the shell (the wad-vs-collider stalemate that left fabric
+#    parked inside the sphere).
+extrudeGain = float(os.environ.get("EXTRUDE_GAIN", "0.75"))      # x projClamp per substep
+# Gain dose-response on the pile-crush replay (seed 3014, median post_viol of
+# 3 runs / persistent sphere-pen fails): 0.5 -> 103/0, 0.75 -> 53/0,
+# 1.0 -> ~26/3-of-6. Higher gain evacuates the wedge faster but at 1.0 the
+# aggressive lateral transport starts leaving knots PINNED INTO the shell
+# (post sphere_pen 0.008-0.018 via the knot's own distance constraints);
+# 0.75 is the strongest spen-clean setting. Lowering EXTRUDE_PRESSURE to 8
+# was strictly worse (median 236 + a spen fail): extruding 1-2-layer regions
+# churns the pile instead of evacuating it.
+extrudePressure = int(os.environ.get("EXTRUDE_PRESSURE", "12"))  # min vtCount (~2+ layers pressed;
+                                                                 # a lone sheet scores ~0)
+extrudeBand = 8.0 * d_offset  # radial engage band above the lower shell: the overfull
+                              # stack forms while the wedge is still closing, so
+                              # evacuation must start BEFORE the final pinch
+
+# Pre-crossing contact repulsion (the solver-integrated contact-pressure piece
+# the PDT paper pairs truncation with; this codebase had truncation + capped
+# recovery only). A unilateral spring displacement applied to the CURRENT
+# positions of the cached candidate pairs (vtBuf/eeBuf, read-only) right after
+# the candidate buffers are built and BEFORE the truncation narrowphase, so the
+# PDT planes still veto any repulsion overshoot within the same substep. With
+# no contact force, a stack transmits no pressure: a plowed pile cannot move
+# its far layers out of the way, so the middle sheets cross and the c<0 push
+# then acts on the wrong side and locks the knot. The repulsion engages only
+# below repulsionEngage * d_offset (dead zone: the settled pile rests at
+# ~d_offset and must not be inflated) and pushes pairs back toward the engage
+# distance (continuous at the engage boundary -- no force jump), step-capped
+# per pair so a feasible-start pair can never be pushed across a third layer
+# in one substep. Pinned targets are skipped (they receive pressure only via
+# the existing c<0 push signal). Env overrides allow parameter sweeps without
+# editing baked constants (values are inlined at warp codegen).
+ringFloorEnable = int(os.environ.get("RING_FLOOR", "1") not in ("0", "", "false"))
+
+# Cloth-cloth contact friction v2 (position-level Coulomb on the cached
+# repulsion pairs). Root cause it addresses (proven by an exact edge-triangle
+# crossing probe): the "dragged side penetrates through the other side" the
+# user sees is NOT a collision failure -- crossings are ZERO throughout those
+# gestures -- it is frictionless SLIP-AROUND: the dragged flank cannot grip
+# the flank it presses, slides over/around it, and reappears on the far side
+# (visually identical to penetration). v2 fixes v1's two rejected flaws:
+#  * cost: v1 re-solved closest-point-on-triangle against prev positions
+#    (doubled the hot loop); v2 reuses the CURRENT contact's barycentric
+#    weights on prev positions -- a few FMAs.
+#  * fold-locking: v1 engaged across the whole repulsion zone, so RESTING
+#    stacks glued into a truss; v2 grips only PRESSED contacts
+#    (gap < frictionEngage*d_offset, well inside the repulsion dead zone) --
+#    resting piles stay slippery.
+frictionMu = float(os.environ.get("FRICTION_MU", "0.4"))
+frictionEngage = float(os.environ.get("FRICTION_ENGAGE", "0.5"))  # x d_offset
+# Lower bound of the friction band: pairs pressed DEEPER than this are in
+# violation-recovery (possibly crossed -- unsigned gap cannot tell), and
+# friction there damps exactly the relative sliding the c<0 recovery push
+# needs to UNCROSS them. Post-friction fuzz showed a fatter sphere-family
+# residue tail (571-609-class knots in half the reps vs ~0 before); gripping
+# only the healthy band returns recovery to frictionless.
+frictionFloor = float(os.environ.get("FRICTION_FLOOR", "0.25"))    # x d_offset
+repulsionK = float(os.environ.get("REPULSION_K", "1.0"))          # spring gain
+repulsionEngage = float(os.environ.get("REPULSION_ENGAGE", "0.8"))  # dead zone, x d_offset
+repulsionIters = int(os.environ.get("REPULSION_ITERS", "2"))      # Jacobi passes/substep
+repulsionEE = int(os.environ.get("REPULSION_EE", "1"))            # include edge-edge pairs
+repulsionCap = 0.5 * d_offset  # per-pair step cap (pushClamp pattern)
+# Approach-gated repulsion (REPULSION_APPROACH=1): the full spring fires only
+# while a pair's gap is CLOSING this substep (measured on the frozen reference
+# positions vs current -- the crossing-risk / plow-pressure regime the
+# repulsion earned its entanglement win in); quasi-static or separating pairs
+# get repulsionSepGain x the correction instead. Rationale: as a static
+# unilateral spring on every cached pair, the repulsion also acts as
+# SCAFFOLDING -- a settled fold stack or floor pile becomes a truss of
+# near-rigid struts (measured: flatten-scenario drag effectiveness 0.36 with
+# the spring vs 0.84 without; folded lobes hang in the air instead of
+# slumping). Gating on approach keeps the pressure-transmission behavior
+# (approaching layers still repel at full gain) while letting settled stacks
+# relax and slide tangentially (tangential slide keeps the gap ~constant, so
+# it no longer fights the spring every substep).
+REPULSION_APPROACH = wp.constant(
+    1 if os.environ.get("REPULSION_APPROACH", "0") not in ("0", "", "false") else 0)
+repulsionSepGain = float(os.environ.get("REPULSION_SEP_GAIN", "0.25"))  # non-approach gain
+repulsionApproachEps = float(os.environ.get("REPULSION_APPROACH_EPS", "0.02")) * d_offset
+
+# --- Analytic collider kind (compile-time) ---
+# COLLIDER_KIND=0 (default): the sphere collider, exactly as before.
+# COLLIDER_KIND=1: an INFINITE CYLINDER along the world-z axis through
+# (center.x, center.y) with the same radius state -- the "rod" test collider
+# (a horizontal rod makes parallel accordion folds trivially reproducible).
+# The analytic distance changes from |p - c| - R to |(p.xy) - (c.xy)| - R with
+# the normal confined to the xy-plane; z is free. Implemented by routing every
+# collider-relative vector through Cloth.radial() (identity for the sphere, xy
+# projection for the rod). COLLIDER_KIND is a wp.constant, so the kind-0
+# codegen and behavior are unchanged; read from the env at import time like
+# the other compile-time knobs (relaunch to switch kind).
+# Kind-1 limitations (deliberate, sphere-crush-specific machinery):
+#   * pinch_extrude and the lateral pile-crush redirects in collider_project /
+#     collider_project_edges are compiled out (they encode sphere geometry;
+#     the rod scenarios never park the collider on a floor pile).
+#   * Sphere.render still draws a GL sphere (headless harnesses don't render).
+COLLIDER_KIND = wp.constant(int(os.environ.get("COLLIDER_KIND", "0")))
+colliderKind = int(os.environ.get("COLLIDER_KIND", "0"))  # host-side mirror
+
+# SOLVER-side ring cull radius (grid Chebyshev distance at or below which a
+# vertex pair is skipped by the self-collision broadphase). Historically 2
+# ("so bending isn't frozen") -- but the 2-ring is a CROSSING BLIND ZONE: the
+# persistent post-drag violation knots dissect as exact edge-triangle
+# intersections whose partners sit at Chebyshev distance 2-3 (a fold pinched
+# to cell scale), where no PDT plane, no repulsion and no side-aware guard
+# exists (ring_floor enforces DISTANCE only, so once crossed it stabilizes
+# the WRONG side). At 1, ring-2 pairs get the full swept truncation +
+# repulsion: a crease is cushioned at d_offset (= the fabric-thickness
+# semantics used everywhere else; rest ring-2 distance is 2*spacing = 3.3x
+# d_offset, so nothing engages until a fold is nearly razor-sharp), and
+# cell-scale fold-throughs can no longer form. Bending is NOT frozen: ring-1
+# (the actual hinge neighbors) stays culled. Metric kernels keep the 2-ring.
+SOLVER_RING = wp.constant(int(os.environ.get("SOLVER_RING", "1")))
+
+# --- Rim pair solver (grab-patch ring-1 kink) ---
+# Valley-plow attribution (exact edge-triangle crossings, classed by member
+# involvement and TRUE grid ring): the dominant persistent in-drag crossing
+# class is the patch RIM folding through its own free SKIRT at SINGLE-CELL
+# scale -- pinned member edges through mixed member/free faces and skirt
+# free-free pairs, all at Chebyshev ring 1, traveling WITH the patch for tens
+# of frames. Ring-1 pairs are excluded from PDT, repulsion, evasion and the
+# uncross resolver BY DESIGN (adjacent vertices legitimately touch; ring-1
+# planes at full d_offset would freeze bending), and members are pinned, so
+# NO runtime mechanism owns the kink: a skirt vertex that snags while its
+# pinned neighbor advances stretches the cell until it passes THROUGH the
+# adjacent cell's fabric.
+# Fix: an explicit small pair list (vertex-face and edge-edge pairs at ring
+# EXACTLY 1, restricted to the grab patch's members + their ring-1 skirt,
+# faces/edges within ring 2 of the members) built host-side at grab time and
+# solved by two tiny dedicated kernels that mirror the standard PDT
+# DIVIDE/TRUNCATE -- exempt from the ring cull because the patch context
+# makes these pairs adversarial, unlike ordinary mesh neighbors -- with a
+# REDUCED separation rimDOffset = RIM_D_FRAC * d_offset. Rest ring-1 gaps on
+# this mesh are >= spacing*sqrt(2)/2 ~ 0.0106 >> 0.0045, and a legitimate
+# tight rim fold rests around d_offset, so the reduced offset engages only on
+# sub-half-fabric-thickness razor kinks and cannot stiffen the visible drape.
+# Pinned members are never truncated and never pushed (their pressure
+# bookkeeping is untouched -- the yield/stall feel is unchanged); their
+# undeliverable separation shares and plane overshoots are reassigned to the
+# free side of the pair, the same reassignment philosophy as GRAB_EVADE and
+# the c<0 lmbd=0 rule. All rim pushes ride apply_truncation's pushClamp bound
+# and floor/shell invariants.
+RIM_SOLVER = wp.constant(
+    1 if os.environ.get("RIM_SOLVER", "1") not in ("0", "", "false") else 0)
+rimSolverEnable = int(os.environ.get("RIM_SOLVER", "1") not in ("0", "", "false"))
+# Separations. EE is the load-bearing one: a rim cell's face has inradius
+# (a + b - c)/2 = (0.015 + 0.015 - 0.0212)/2 ~ 0.0044, so an edge crossing
+# through the FACE INTERIOR passes ~0.0044 from all three boundary edges --
+# an EE offset of 0.5*d_offset (0.0045) is marginally inert exactly there
+# (measured: v1 with 0.0045 left the interior channel open and crossings
+# tunneled through it, then persisted). 0.75*d_offset gives the interior
+# crossing a real ~0.0023 recovery depth. VT stays at 0.5*d_offset (vertex
+# paths near a face vertex are sealed by the vertex's own plane).
+rimDOffsetVT = float(os.environ.get("RIM_D_FRAC_VT", "0.5")) * d_offset
+rimDOffsetEE = float(os.environ.get("RIM_D_FRAC_EE", "0.75")) * d_offset
+maxRimVT = 16384   # rim vertex-face pair capacity (a ~90-member patch builds ~3k)
+maxRimEE = 32768   # rim edge-edge pair capacity (a ~90-member patch builds ~6k)
+
+# --- Crossing resolver ("uncross") ---
+# Every separation mechanism above (PDT truncation planes, the c<0 recovery
+# push, contact repulsion) pushes each side of a close pair away from the
+# other's surface ON THE SIDE IT CURRENTLY IS. Once two sheets have actually
+# CROSSED (fast flick + fold pinch: a post-truncation mover carries a vertex
+# through a near-zero gap), that rule is exactly wrong: the intersection
+# contour is locked in place forever -- the violating band around the contour
+# stays gap~0 while every mechanism maintains the crossing (measured: the
+# persistent post-release violation clusters coincide 1:1 with exact
+# edge-triangle intersections). The resolver runs ONCE PER FRAME outside the
+# captured graph: an exact segment-triangle intersection sweep (hash-grid
+# walk over current positions, Moller-Trumbore, min-id dedup) finds truly
+# crossed (edge, face) pairs -- crossing is decided by an EXACT test, never a
+# heuristic side guess, so a merely compressed contact can never be
+# "resolved" into a crossing -- and each crossed edge gets its shallower free
+# endpoint moved back across the face plane by (depth + margin), capped per
+# frame. That flips the pair to the un-crossed configuration with minimal
+# motion; the normal PDT/repulsion machinery then separates it correctly on
+# the next substeps, and the contour shrinks frame over frame.
+uncrossEnable = int(os.environ.get("UNCROSS", "1") not in ("0", "", "false"))
+_UNCROSS_DEBUG = os.environ.get("UNCROSS_DEBUG", "") not in ("", "0")
+maxCross = 4096                   # crossed-pair capacity per frame sweep
+# Clearance past the face plane after the flip. Note a flip landing at
+# 0.25*d_offset sits exactly at the c<0 barrier floor (farBarrierFloor), i.e.
+# in the band where no barrier plane protects its return -- but raising the
+# landing to 0.5*d_offset measured SLOWER on the recorded pleat core (longer
+# flip segments displace more fabric per flip in an already-tight channel),
+# so the default stays 0.25; the knob remains for experiments.
+uncrossMargin = float(os.environ.get("UNCROSS_MARGIN", "0.25")) * d_offset
+uncrossStep = 0.75 * d_offset     # per-vertex per-frame displacement cap
+# Hard bound of the DEPTH-COMPLETE flip cap (see _resolve_crossings): a
+# vertex's flip may exceed uncrossStep up to this, but only when its own
+# deepest crossing NEEDS that much to land past the partner plane. The locked
+# recorded 400x400 wad measured flip needs of 0.009-0.014 (depth+margin) vs
+# the fixed 0.00675 cap -- capped flips land still-crossed inside the c<0
+# barrier band and are re-locked by the substeps (a ~390-pair knot drained at
+# ~2 pairs/frame = the user's permanent penetration). 2*d_offset covers the
+# deepest measured need with margin; UNCROSS_STEP_MAX=0.75 restores the
+# legacy fixed-cap behavior exactly.
+uncrossStepMax = float(os.environ.get("UNCROSS_STEP_MAX", "2.0")) * d_offset
+# Large-wad recovery burst: when a quiescent sweep finds MORE than
+# uncrossBurstN crossed pairs, run up to uncrossBurstIters detect->flip
+# rounds in that frame instead of uncrossIters. A big locked wad drains by
+# CONTOUR PEELING -- only the ring of vertices currently in crossing pairs
+# can flip, so one round per frame retracts one ring (~10-30 pairs) and a
+# ~650-pair release wad needs more frames than a user watches (measured:
+# FINAL 34 after the recorded session's 47 post-release frames -- still
+# draining, just too slowly). Extra WITHIN-frame rounds peel deeper rings:
+# each round's flips land past the partner plane (depth-complete cap), so
+# the next round's sweep sees the newly-exposed ring, while the per-frame
+# flip-lock (moved set) prevents ping-pong and the veto still blocks
+# foreign-layer flips. WITHIN a frame the sweep counts still grow (it0 400
+# -> it2 588 on the recorded 400x400 wad: the peel front's neighbor edges
+# enter crossing as their vertices stay one ring behind) exactly like the
+# old capped-flip cascade (366 -> 621) -- the difference is BETWEEN frames:
+# depth-complete flips stick (the substeps relax the peeled band instead of
+# re-locking it), so the frame-over-frame count collapses 400 -> 406 -> 252
+# -> 188 -> 128 -> 84 -> 66 -> 0 (~6 frames to sub-100 vs ~15 single-round).
+# Burst rounds only ever run on quiescent frames (the gated path), never
+# during interaction. The recorded session releases wads of 600-775 pairs
+# with ~47 user-visible frames before the harness FINAL probe; single-round
+# frames drain them at ~10-30 pairs/frame (measured: one rep entered the
+# window at ~600 and ended at 175, still draining, ~10 frames short), while
+# burst frames measured up to ~50 pairs/frame on the same class. On the
+# saved settled wads burst=3-with-dilation was within noise of burst=1
+# (f44 vs f39 to zero on the 714 state, equal elsewhere), so the burst's
+# value is the fresh-release regime, not settled cores.
+uncrossBurstN = int(os.environ.get("UNCROSS_BURST_N", "100"))
+uncrossBurstIters = int(os.environ.get("UNCROSS_BURST_ITERS", "3"))
+# Regional flip dilation: diffuse each flip vector into the flipped vertex's
+# same-sheet grid neighborhood (uncrossDilate rings of the 4-neighborhood,
+# decayed by uncrossDilateGain per ring, veto-tested like the flips
+# themselves). WHY: the residual wad class that resists plain flipping is a
+# SELF-PLEAT -- a fold lobe pushed through itself (measured on the recorded
+# 400x400 session: 113 pairs, edges and faces in the SAME 22x16-cell window,
+# material ring 4-19). Flipping only the crossed ring while the lobe's
+# interior stays put leaves the interior tension to yank the ring back
+# through within the frame's 30 substeps (measured: ~90% of persisting pairs
+# had a flipped endpoint -- flips applied, then undone; net drain ~2/frame).
+# Dragging the 1-2 ring neighborhood along with each flip moves the lobe
+# BODILY, so the flip sticks and the next ring enters the (exact) sweep on
+# the following round/frame. UNCROSS_DILATE=0 disables.
+uncrossDilate = int(os.environ.get("UNCROSS_DILATE", "2"))
+uncrossDilateGain = float(os.environ.get("UNCROSS_DILATE_GAIN", "0.6"))
+# Settle-interleaved recovery: when a quiescent frame's first sweep finds a
+# large wad (> uncrossBurstN), split the frame's substep replays into
+# uncrossInterleave chunks and run a full resolver pass between chunks --
+# resolve / settle 10 substeps / resolve / settle / resolve / settle instead
+# of one pass per frame. Unlike within-frame burst rounds (which re-sweep
+# UNRELAXED positions and mostly re-see their own peel front), each
+# interleaved pass acts on constraint-relaxed geometry, so it multiplies the
+# frame-over-frame drain rate by ~the chunk count. This is what makes the
+# recorded session's deepest release wads (~800 pairs, draining ~10/frame
+# single-pass = ~50 frames short of the user's attention span) clear inside
+# the post-release window. Costs ~2 extra host sweeps (~10-15 ms) per
+# RECOVERY frame only; clean and small-wad frames are untouched.
+# UNCROSS_INTERLEAVE=1 disables. Very large wads (> uncrossInterleaveBigN
+# pairs -- fresh releases still being fed by the collapsing drape) escalate
+# to uncrossInterleaveBig passes: the recorded session's ~850-pair worst
+# releases drained ~15 pairs/frame at 3 passes (ended at 150 of the ~47
+# post-release frames the user actually watches) and need ~25/frame.
+uncrossInterleave = int(os.environ.get("UNCROSS_INTERLEAVE", "3"))
+uncrossInterleaveBig = int(os.environ.get("UNCROSS_INTERLEAVE_BIG", "5"))
+uncrossInterleaveBigN = int(os.environ.get("UNCROSS_INTERLEAVE_BIG_N", "300"))
+# detect->flip rounds per frame. 1 is deliberate: repeated rounds with the
+# flipped-vertex lock CASCADE in a band crossing -- flipping v resolves its
+# pair but puts v's edges to its unflipped neighbors in crossing, and the
+# lock then flips those neighbors too, so the flipped region GROWS each round
+# (measured: within-frame counts 366 -> 621 and never converging). One round
+# per frame lets the constraints/bending/ring-floor react to each flip, and
+# the contour shrinks frame over frame instead.
+uncrossIters = int(os.environ.get("UNCROSS_ITERS", "1"))
+# Cadence under active forcing (grab held / sphere driven). Quiescent frames
+# resolve at full rate (with idle backoff); while the user is actively
+# forcing, the resolver stays OFF by default: resolving mid-plow FIGHTS the
+# forcing (30 substeps re-cross what one host pass uncrossed) and its flips
+# in a hard pinch occasionally trigger a strain blow-up (measured: 0.43-0.49
+# sphere-metric transients + 125-viol locked residue ONLY in
+# resolve-during-forcing configurations; never in quiescent-only). With the
+# SOLVER_RING=1 prevention the in-drag crossing counts stay tiny (4-27 pairs
+# vs ~500 before), so post-release cleanup is enough. uncrossForcedEvery can
+# re-enable throttled in-drag pruning (every K-th frame, only while the knot
+# is <= uncrossForcedMaxN pairs) for experiments; UNCROSS_GATED=0 = resolve
+# every frame regardless (legacy always-on).
+uncrossGated = int(os.environ.get("UNCROSS_GATED", "1") not in ("0", "", "false"))
+# MASKED in-drag resolution (built for the round-10 lock fix, measured, and
+# left DEFAULT-OFF): the recorded 400x400 session's crossing wad forms
+# MID-DRAG at the plow front and then trails the moving anchor
+# (near_anchor=0 at radius 0.2), so sweeps with the forcing sites masked out
+# (crossed pairs within uncrossMaskR of any active grab anchor, or of the
+# sphere shell while it is driven, are skipped) looked like the way to prune
+# the wad before release. MEASURED VERDICT on the recorded session (7 reps,
+# every-2-frames masked sweeps): pruning LOSES to the plow's creation rate
+# -- the wad grew 96 -> 745 pairs THROUGH active pruning (apply ~1300/frame)
+# because the "trailing" fabric is still the towed sheet, not quiescent
+# cloth -- and the churned release state it left behind stalled the
+# post-release drain (one rep ended at 714, worse than the no-pruning
+# ceiling; in-drag flips metric 26-41 vs ~10). Meanwhile the post-release
+# stack (depth-complete flips + regional dilation) clears even 700-pair
+# release wads in < 45 frames on its own. UNCROSS_FORCED_EVERY > 0 re-arms
+# the masked cadence for experiments.
+uncrossForcedEvery = int(os.environ.get("UNCROSS_FORCED_EVERY", "0"))  # 0 = never
+uncrossForcedMaxN = int(os.environ.get("UNCROSS_FORCED_MAXN", str(maxCross)))
+uncrossMaskR = float(os.environ.get("UNCROSS_MASK_R", "0.25"))
+# Flip-side policy: "cluster" = union-find the crossing edges into contour
+# clusters and flip the coherent minority/least-depth side per cluster;
+# "pair" = independent per-pair least-motion (can pick incoherent directions
+# along a band).
+uncrossVote = os.environ.get("UNCROSS_VOTE", "cluster")
+# Vectorized no-new-crossing veto (see _resolve_crossings / _veto_flips_vec);
+# UNCROSS_VETO_CHECK=1 cross-checks it against the reference loop every round.
+uncrossVetoVec = int(os.environ.get("UNCROSS_VETO_VEC", "1") not in ("0", "", "false"))
+uncrossVetoCheck = int(os.environ.get("UNCROSS_VETO_CHECK", "0") not in ("0", "", "false"))
 
 # Self-collision is split into a hash-grid "detect" pass that caches candidate
 # primitives and a query-free "narrowphase" pass that does the segment-segment /
@@ -237,6 +953,12 @@ gridCellSize = 0.024
 
 # Thread count for the single-slot detection-bounds reductions (grid-stride loops).
 boundsReduceThreads = 16384
+
+# FAR_DEBUG=1: snapshot pos at intra-substep pipeline boundaries into debug
+# arrays (post-detect, pre-narrowphase, post-truncation, pre-fingertip) so a
+# host probe stepping between graph replays can attribute exactly WHERE in the
+# substep a self-crossing was created. Diagnostic only; default off.
+farDebug = os.environ.get("FAR_DEBUG", "0") not in ("0", "", "false")
 
 # Cached non-ring neighbor vertices per vertex (detect_gather -> detect_expand).
 # Crumpled-plateau counts are ~20-30; sized for a compressed squeeze; the
@@ -340,6 +1062,14 @@ class Particle:
     # of fabric (and, being inv_mass==0, ignores collision), so grabbing a
     # fingertip-sized patch both feels natural and distributes the pull.
     group: list = field(default_factory=list)
+    # Last frame's committed anchor point (per-substep sweep origin); None until
+    # the first active update.
+    prev_target = None
+    # Sliding-grab state: consecutive frames of chronic pointer lag, and the
+    # last frame's lag (a shrinking lag = the anchor is catching up after a
+    # flick, NOT snagged -- see update_anchors).
+    slide_frames = 0
+    last_lag = 0.0
 
     def drag(self) -> Self:
         self.origin = wp.vec2(self.screen)
@@ -517,12 +1247,68 @@ class Cloth(Input):
         self.colliderDeltaQ = wp.zeros(1, dtype=wp.quat)
         self._graphs = {}  # (iterations, integrate, self_collision, solve) -> captured graph
 
+        # Grab-anchor sweep state: dragged (pinned) patches must move PER SUBSTEP
+        # inside the captured graph, exactly like the sphere -- a host-side
+        # once-per-frame teleport is invisible to collision (no sweep), so a drag
+        # of a few cm/frame lands the frozen reference state already inside other
+        # fabric and the PDT can neither prevent nor recover the interpenetration
+        # (measured: dragging one flank across into the other collapsed the self-
+        # collision gap to ~1e-5 with persistent violations and rising frame
+        # times). simulate() packs these from self.activeGrabs each frame:
+        # members are (particle id, owning grab index, world offset); anchorPos
+        # holds each grab's CURRENT substep anchor point, advanced by anchorDelta
+        # (frame motion / steps) once per substep.
+        self.activeGrabs = []                     # [(prev vec3, target vec3, ids, offs)]
+        self.anchorMemberIds = wp.zeros(maxGrabMembers, dtype=wp.int32)
+        self.anchorMemberAx = wp.zeros(maxGrabMembers, dtype=wp.int32)
+        self.anchorMemberOff = wp.zeros(maxGrabMembers, dtype=wp.vec3)
+        self.anchorMemberCount = wp.zeros(1, dtype=wp.int32)
+        self.anchorPos = wp.zeros(maxGrabs, dtype=wp.vec3)
+        self.anchorDelta = wp.zeros(maxGrabs, dtype=wp.vec3)
+        self.anchorCount = wp.zeros(1, dtype=wp.int32)
+        # Load-yielding grip: per-grab plow-pressure accumulators (net vector and
+        # magnitude sum), filled in-graph each substep by accumulate_grab_pressure
+        # from the pressure shares the narrowphase records on grabbed members'
+        # push[] slots; zeroed per frame in simulate(), read back after the frame
+        # for the host-side grip yield in update_anchors (one frame of latency).
+        self.grabPressure = wp.zeros(maxGrabs, dtype=wp.vec3)
+        self.grabPressureMag = wp.zeros(maxGrabs, dtype=float)
+        self.grabPressureHost = {}  # primary particle id -> (net vec3, |.| sum, n members)
+        # Rim pair solver (see RIM_SOLVER): explicit ring-1 pair lists for the
+        # active grab patches' rims, rebuilt host-side when grab membership
+        # changes (grab / release / sliding re-grab), zero-count otherwise.
+        # Allocated up front so the captured graph can reference them.
+        self.rimVTPairs = wp.zeros((maxRimVT, 4), dtype=wp.int32)  # (v, i0, i1, i2)
+        self.rimVTCount = wp.zeros(1, dtype=wp.int32)
+        self.rimEEPairs = wp.zeros((maxRimEE, 4), dtype=wp.int32)  # (va, vb, vc, vd)
+        self.rimEECount = wp.zeros(1, dtype=wp.int32)
+        self._rimSig = None          # active-grab membership signature
+        self._rimDirty = False
+        self._rimStage = (np.zeros((0, 4), np.int32), np.zeros((0, 4), np.int32))
+
         # Self-collision candidate caches (detect writes, narrowphase reads) + a global
         # overflow counter (>0 means a per-primitive buffer filled and dropped a
         # candidate -> possible penetration; grow maxVT/maxEE).
         self.vtCount = wp.zeros(self.numParticles, dtype=wp.int32)
         self.vtBuf = wp.zeros(self.numParticles * maxVT, dtype=wp.int32)
         self.selfCollisionOverflow = wp.zeros(1, dtype=wp.int32)
+        # Per-vertex crossing budget (see FAR_GUARD): reset each substep by
+        # clamp_displacement, tightened by the narrowphase (atomic_min kappa*d
+        # per pair), consumed by apply_truncation's push clamp, leftover read
+        # by fingertip_project's eviction cap.
+        self.pushLimit = wp.zeros(self.numParticles, dtype=float)
+        # Per-vertex exact-crossing flags (see FLAG_GUARD): refreshed once per
+        # frame by simulate() while a grab is active; read by the c<0 barrier
+        # gating in the narrowphase (n_grabs-gated, so a stale buffer is
+        # never consulted without a grab).
+        self.crossedFlag = wp.zeros(self.numParticles, dtype=wp.int32)
+        if farDebug:
+            # Intra-substep pos snapshots (see farDebug): post-detect,
+            # pre-narrowphase, post-truncation, pre-fingertip.
+            self.dbgPosDet = wp.zeros(self.numParticles, dtype=wp.vec3)
+            self.dbgPosNar = wp.zeros(self.numParticles, dtype=wp.vec3)
+            self.dbgPosPDT = wp.zeros(self.numParticles, dtype=wp.vec3)
+            self.dbgPosCol = wp.zeros(self.numParticles, dtype=wp.vec3)
 
         # Unique mesh edges (sorted vertex pairs) for edge-edge self-collision.
         edge_set = set()
@@ -656,6 +1442,17 @@ class Cloth(Input):
         # init()/init_headless() outside graph capture).
         self.grid = wp.HashGrid(128, 128, 128)
 
+        # Crossing-resolver state (per-frame exact intersection sweep; see the
+        # uncross* constants). hostEdgeIds mirrors edgeIds for the host-side
+        # vote; crossBounds[0] = longest CURRENT edge (the sweep runs on current
+        # positions, not the frozen reference, so it gets its own bound).
+        self.crossPairs = wp.zeros((maxCross, 2), dtype=wp.int32)
+        self.crossCount = wp.zeros(1, dtype=wp.int32)
+        self.crossBounds = wp.zeros(1, dtype=float)
+        self.hostEdgeIds = edge_arr
+        self.hostVertFaceOff = vf_off
+        self.hostVertFaceIds = self.vertFaceIds.numpy()
+
         print(str(self.numParticles) + " particles created")
         print(str(self.numTris) + " triangles created")
         print(str(self.distConstraints.count) + " distance constraints created")
@@ -786,6 +1583,32 @@ class Cloth(Input):
 
     @staticmethod
     @wp.func
+    def within_ring_solver(grid_rc: wp.array2d(dtype=wp.int32), a: wp.int32, b: wp.int32) -> bool:
+        # SOLVER-side ring cull (see SOLVER_RING). The metric kernels
+        # (count_self_contacts / self_contact_gaps) keep the historical 2-ring
+        # via within_ring_rc so reported numbers stay comparable.
+        dr = grid_rc[a, 0] - grid_rc[b, 0]
+        dc = grid_rc[a, 1] - grid_rc[b, 1]
+        if dr < 0:
+            dr = -dr
+        if dc < 0:
+            dc = -dc
+        return wp.max(dr, dc) <= SOLVER_RING
+
+    @staticmethod
+    @wp.func
+    def ring_solver(ar: wp.int32, ac: wp.int32, br: wp.int32, bc: wp.int32) -> bool:
+        # within_ring_solver on PRE-LOADED (row, col) pairs.
+        dr = ar - br
+        dc = ac - bc
+        if dr < 0:
+            dr = -dr
+        if dc < 0:
+            dc = -dc
+        return wp.max(dr, dc) <= SOLVER_RING
+
+    @staticmethod
+    @wp.func
     def point_segment_distance(p: wp.vec3, a: wp.vec3, b: wp.vec3) -> float:
         # Distance from point p to segment [a, b].
         ab = b - a
@@ -841,6 +1664,26 @@ class Cloth(Input):
 
     @staticmethod
     @wp.func
+    def radial(v: wp.vec3):
+        # Collider-relative RADIAL part of a vector: the component the analytic
+        # distance |radial(p - c)| - R acts on. Sphere (kind 0): the identity, so
+        # every kind-0 formula below is bit-identical to the sphere-only code.
+        # Infinite z-cylinder (kind 1): the xy projection -- z is free.
+        if COLLIDER_KIND == 1:
+            return wp.vec3(v[0], v[1], 0.0)
+        return v
+
+    @staticmethod
+    @wp.func
+    def axial(v: wp.vec3):
+        # Complement of radial(): the collider's free direction. Zero for the
+        # sphere (no free direction), the z component for the cylinder.
+        if COLLIDER_KIND == 1:
+            return wp.vec3(0.0, 0.0, v[2])
+        return wp.vec3(0.0, 0.0, 0.0)
+
+    @staticmethod
+    @wp.func
     def swept_sphere_ccd(pos: wp.vec3,
                          vel: wp.vec3,
                          center: wp.vec3,
@@ -852,10 +1695,13 @@ class Cloth(Input):
         # growing sphere: solve for the time-of-impact and return the contact point
         # on the swept surface. Exact for a convex analytic collider, so a fast
         # sphere drag cannot tunnel through the cloth regardless of speed.
-        s = center - pos
+        # COLLIDER_KIND 1: the same quadratic solved on the RADIAL (xy) projection
+        # is exact for the infinite z-cylinder -- axial motion never changes the
+        # distance to the surface.
+        s = Cloth.radial(center - pos)
         vc = dc / dt
         vr = dr / dt
-        v = vc - vel
+        v = Cloth.radial(vc - vel)
 
         c = wp.dot(s, s) - radius * radius
         if c < 0.0:
@@ -880,7 +1726,7 @@ class Cloth(Input):
 
         p = pos + t * vel
         o = center + t * vc
-        r = p - o
+        r = Cloth.radial(p - o)
 
         # CARRY-ALONG reconstruction: keep the sphere-relative contact direction the
         # particle had at the time of impact and evaluate it at the END pose -- the
@@ -897,7 +1743,11 @@ class Cloth(Input):
             # Degenerate (particle at the TOI center): let Pass 2 resolve it.
             return False, wp.vec3()
         n = r / d_rel
-        return True, center + dc + (radius + dr) * n
+        # Cylinder: the carried direction is radial (xy); the particle keeps its
+        # own free-axis coordinate at the end of the substep. axial() is the zero
+        # vector for the sphere, so kind 0 is unchanged.
+        return True, center + dc + (radius + dr) * n \
+            + Cloth.axial(pos + vel * dt - center - dc)
 
     @staticmethod
     @wp.kernel
@@ -1022,7 +1872,7 @@ class Cloth(Input):
         while wp.hash_grid_query_next(query, u):
             if wp.length(prev_pos[u] - xv) > r:
                 continue  # the grid over-returns to cell granularity
-            if Cloth.within_ring_rc(grid_rc, v, u):
+            if Cloth.within_ring_solver(grid_rc, v, u):
                 continue  # every face/edge candidate via u would fail the ring cull
             if n < maxNbr:
                 nbr_buf[base + n] = u
@@ -1199,9 +2049,9 @@ class Cloth(Input):
                     i0 = tri_ids[face, 0]
                     i1 = tri_ids[face, 1]
                     i2 = tri_ids[face, 2]
-                    if (Cloth.ring2_rc(v_row, v_col, grid_rc[i0, 0], grid_rc[i0, 1])
-                            or Cloth.ring2_rc(v_row, v_col, grid_rc[i1, 0], grid_rc[i1, 1])
-                            or Cloth.ring2_rc(v_row, v_col, grid_rc[i2, 0], grid_rc[i2, 1])):
+                    if (Cloth.ring_solver(v_row, v_col, grid_rc[i0, 0], grid_rc[i0, 1])
+                            or Cloth.ring_solver(v_row, v_col, grid_rc[i1, 0], grid_rc[i1, 1])
+                            or Cloth.ring_solver(v_row, v_col, grid_rc[i2, 0], grid_rc[i2, 1])):
                         continue
                     # Dedup: accept the face only from its smallest in-range vertex
                     # (same segment and per-face radius for all of the face's
@@ -1230,7 +2080,7 @@ class Cloth(Input):
                 other = e_other[ke]
                 # (u == other is impossible: `other` is a mesh neighbor of v,
                 # within grid ring 1, and the gather ring cull kept only
-                # neighbors beyond ring 2.)
+                # neighbors beyond ring SOLVER_RING >= 1.)
                 xo = e_xo[ke]
                 # Responsibility: only e's endpoint NEARER to u appends (ties -> va).
                 # Both endpoint threads compute bitwise-identical distances here
@@ -1250,7 +2100,7 @@ class Cloth(Input):
                 du_seg = Cloth.point_segment_distance(xu, pa, pb)
                 if du_seg > e_rc[ke]:
                     continue  # u outside e's widest capsule (coarse pretest)
-                if Cloth.ring2_rc(e_or[ke], e_oc[ke], u_row, u_col):
+                if Cloth.ring_solver(e_or[ke], e_oc[ke], u_row, u_col):
                     continue  # pairwise ring cull ((v,u) already culled by gather)
                 if n_f < 0:
                     # First passing own edge: cache u's incident edges once
@@ -1283,8 +2133,8 @@ class Cloth(Input):
                         continue
                     # Pairwise 2-ring cull: (va,u)/(vb,u) are done above; check
                     # both e endpoints against f's OTHER endpoint.
-                    if (Cloth.ring2_rc(v_row, v_col, f_wr[kf], f_wc[kf])
-                            or Cloth.ring2_rc(e_or[ke], e_oc[ke], f_wr[kf], f_wc[kf])):
+                    if (Cloth.ring_solver(v_row, v_col, f_wr[kf], f_wc[kf])
+                            or Cloth.ring_solver(e_or[ke], e_oc[ke], f_wr[kf], f_wc[kf])):
                         continue
                     # Dedup: accept f only from its smallest in-capsule endpoint
                     # (same per-candidate radius from both endpoint threads).
@@ -1503,9 +2353,9 @@ class Cloth(Input):
                     i2 = tri_ids[f, 2]
                     if v == i0 or v == i1 or v == i2:
                         continue
-                    if (Cloth.within_ring_rc(grid_rc, v, i0)
-                            or Cloth.within_ring_rc(grid_rc, v, i1)
-                            or Cloth.within_ring_rc(grid_rc, v, i2)):
+                    if (Cloth.within_ring_solver(grid_rc, v, i0)
+                            or Cloth.within_ring_solver(grid_rc, v, i1)
+                            or Cloth.within_ring_solver(grid_rc, v, i2)):
                         continue
                     # Exact relevance (swept-magnitude criterion, >= expand's
                     # one-sided parity): v's own motion plus E's own sweep must
@@ -1536,11 +2386,11 @@ class Cloth(Input):
                 if edge_len[eu] > edgeLenCap:
                     continue  # oversized-vs-oversized: oversized_pairs
                 w = vc + vd - v
-                # Pairwise 2-ring culls, identical predicates to expand.
-                if (Cloth.within_ring_rc(grid_rc, a, v)
-                        or Cloth.within_ring_rc(grid_rc, b, v)
-                        or Cloth.within_ring_rc(grid_rc, a, w)
-                        or Cloth.within_ring_rc(grid_rc, b, w)):
+                # Pairwise ring culls, identical predicates to expand.
+                if (Cloth.within_ring_solver(grid_rc, a, v)
+                        or Cloth.within_ring_solver(grid_rc, b, v)
+                        or Cloth.within_ring_solver(grid_rc, a, w)
+                        or Cloth.within_ring_solver(grid_rc, b, w)):
                     continue
                 # Exact relevance (swept-magnitude criterion, matching expand):
                 # the frozen SEGMENT gap must be closable by the pair's own
@@ -1624,10 +2474,10 @@ class Cloth(Input):
             vd = edge_ids[F, 1]
             if vc == a or vc == b or vd == a or vd == b:
                 continue
-            if (Cloth.within_ring_rc(grid_rc, a, vc)
-                    or Cloth.within_ring_rc(grid_rc, a, vd)
-                    or Cloth.within_ring_rc(grid_rc, b, vc)
-                    or Cloth.within_ring_rc(grid_rc, b, vd)):
+            if (Cloth.within_ring_solver(grid_rc, a, vc)
+                    or Cloth.within_ring_solver(grid_rc, a, vd)
+                    or Cloth.within_ring_solver(grid_rc, b, vc)
+                    or Cloth.within_ring_solver(grid_rc, b, vd)):
                 continue
             yc = prev_pos[vc]
             yd = prev_pos[vd]
@@ -1649,14 +2499,25 @@ class Cloth(Input):
             pos: wp.array(dtype=wp.vec3),       # X + accumulated displacement
             vt_count: wp.array(dtype=wp.int32),    # cached candidate counts (detect_expand)
             vt_buf: wp.array(dtype=wp.int32),      # cached candidate tri ids
+            n_grabs: wp.array(dtype=wp.int32),     # active grab count (c>=0 budget gate)
+            crossed: wp.array(dtype=wp.int32),     # exact crossed-vertex flags (see FLAG_GUARD)
             truncation_ts: wp.array(dtype=float),  # pre-filled with 1.0 (atomic_min)
-            push: wp.array(dtype=wp.vec3)):        # pre-zeroed C<0 recovery (atomic_add)
+            push: wp.array(dtype=wp.vec3),         # pre-zeroed C<0 recovery (atomic_add)
+            push_limit: wp.array(dtype=float)):    # crossing budget (atomic_min, see FAR_GUARD)
         # Vertex-triangle NARROWPHASE (query-free): iterate the cached candidate faces
         # (detect_gather+detect_expand did the broadphase + 2-ring cull) and do the DIVIDE/TRUNCATE.
         # No BVH query here -> no 32 KiB traversal stack -> high occupancy.
         v = wp.tid()
         if inv_mass[v] == 0.0:
             return
+
+        # The c >= 0 budget writes only have protective value while a grab is
+        # active: with no grab, fingertip_project is a no-op and the recovery
+        # pushes alone cannot cross a c >= 0 pair (|pushA| + |pushB| <=
+        # 2*pushClamp = d_offset <= d). Gating them recovers the pristine
+        # narrowphase atomics traffic for grab-free scenes (the 400x400 drape
+        # perf gate measured the ungated writes at ~+1.4 ms/frame).
+        budget_on = FAR_GUARD != 0 and n_grabs[0] > 0
 
         xv = prev_pos[v]
         dxv = pos[v] - xv
@@ -1698,15 +2559,101 @@ class Cloth(Input):
                     lmbd = 0.5
                 else:
                     lmbd = wp.clamp(delta_t_n / s, 0.05, 0.95)
+                # If the triangle side cannot move (fully pinned -- e.g. a dragged
+                # grab patch plowing through fabric), its lmbd share of the
+                # correction would be silently DISCARDED below and the free vertex
+                # would receive as little as 5% of the needed separation per
+                # substep -- guaranteed crossing under a pinned plow (the fuzzer's
+                # dominant failure). Reassign the undeliverable share to the free
+                # side instead.
+                if inv_mass[i0] == 0.0 and inv_mass[i1] == 0.0 and inv_mass[i2] == 0.0:
+                    lmbd = 0.0
                 depth = -c  # positive penetration
-                wp.atomic_add(push, v, (1.0 - lmbd) * depth * n)
                 tp = lmbd * depth / 3.0
+                # Pinned (grabbed) triangle vertices record the share they COULD
+                # NOT take as a pressure signal (sim-inert: apply_truncation
+                # skips inv_mass==0); see the load-yielding grip notes.
+                # With GRAB_EVADE on, each pinned vertex's undeliverable third
+                # (tp) is reassigned to the free vertex v -- the PER-VERTEX
+                # generalization of the all-pinned lmbd=0 rule above (which it
+                # reproduces exactly: lmbd=0 makes tp 0 and v_share depth).
+                # A PARTIALLY pinned triangle (the grab patch RIM -- exactly
+                # where fabric is pinched at grip closure) otherwise discards
+                # the pinned share and under-delivers separation.
+                pp = depth / 3.0
+                v_share = (1.0 - lmbd) * depth
                 if inv_mass[i0] != 0.0:
                     wp.atomic_add(push, i0, -tp * n)
+                else:
+                    wp.atomic_add(push, i0, -pp * n)
+                    if GRAB_EVADE != 0:
+                        v_share += tp
                 if inv_mass[i1] != 0.0:
                     wp.atomic_add(push, i1, -tp * n)
+                else:
+                    wp.atomic_add(push, i1, -pp * n)
+                    if GRAB_EVADE != 0:
+                        v_share += tp
                 if inv_mass[i2] != 0.0:
                     wp.atomic_add(push, i2, -tp * n)
+                else:
+                    wp.atomic_add(push, i2, -pp * n)
+                    if GRAB_EVADE != 0:
+                        v_share += tp
+                wp.atomic_add(push, v, v_share * n)
+                if FAR_GUARD != 0:
+                    # CROSSING BUDGET (see FAR_GUARD): tighten so the
+                    # post-truncation movers (recovery push, fingertip
+                    # eviction) cannot compose across the remaining gap d.
+                    # BUDGET EXEMPTION for a fully-pinned opponent: against a
+                    # dragged grab patch the bounded push/evasion is the ONLY
+                    # separator (lmbd = 0 above), and the burst class this
+                    # budget exists for is free-free -- so a pinned-plow pair
+                    # keeps full evasion bandwidth.
+                    if not (inv_mass[i0] == 0.0 and inv_mass[i1] == 0.0
+                            and inv_mass[i2] == 0.0):
+                        wp.atomic_min(push_limit, v, farGuardKappa * d)
+                    if inv_mass[i0] != 0.0:
+                        wp.atomic_min(push_limit, i0, farGuardKappa * d)
+                    if inv_mass[i1] != 0.0:
+                        wp.atomic_min(push_limit, i1, farGuardKappa * d)
+                    if inv_mass[i2] != 0.0:
+                        wp.atomic_min(push_limit, i2, farGuardKappa * d)
+                    bar_floor = farBarrierFloor
+                    if FLAG_GUARD != 0 and n_grabs[0] > 0 \
+                            and crossed[v] == 0 and crossed[i0] == 0 \
+                            and crossed[i1] == 0 and crossed[i2] == 0:
+                        # Side-aware floor (see FLAG_GUARD): the exact sweep
+                        # says nobody here is crossed, so the "wrong-side
+                        # depth" lock hazard does not apply -- protect the
+                        # sub-floor gap the 400^2 plow front presses pairs
+                        # into before they cross.
+                        bar_floor = farBarrierEps
+                    if d > bar_floor * d_offset:
+                        # CROSSING BARRIER: the offset plane is unreachable
+                        # (c < 0) but the frozen surfaces are still d apart --
+                        # truncate each free vertex against the remaining-gap
+                        # split plane so no truncated writer can complete the
+                        # crossing this substep. The recovery push above still
+                        # separates the pair exactly as before. Floor-gated
+                        # (farBarrierFloor): an ALREADY-CROSSED pair measures
+                        # its wrong-side depth as d ~ 0 here, and an unfloored
+                        # barrier would truncate the RETURN motion and lock
+                        # the crossing (measured as a growing post-release
+                        # crossing band). With FLAG_GUARD the floor is side-
+                        # aware (bar_floor above).
+                        p_bar = cp + (lmbd * d) * n
+                        wp.atomic_min(truncation_ts, v,
+                                      Cloth.planar_truncation_t(xv, dxv, n, p_bar))
+                        if inv_mass[i0] != 0.0:
+                            wp.atomic_min(truncation_ts, i0,
+                                          Cloth.planar_truncation_t(p0, dt0, -n, p_bar))
+                        if inv_mass[i1] != 0.0:
+                            wp.atomic_min(truncation_ts, i1,
+                                          Cloth.planar_truncation_t(p1, dt1, -n, p_bar))
+                        if inv_mass[i2] != 0.0:
+                            wp.atomic_min(truncation_ts, i2,
+                                          Cloth.planar_truncation_t(p2, dt2, -n, p_bar))
                 continue
 
             # TRUNCATE: split the gap so the harder-approaching side gives more.
@@ -1721,12 +2668,55 @@ class Cloth(Input):
             p_plane = cp + (d_offset + lmbd * c) * n
 
             wp.atomic_min(truncation_ts, v, Cloth.planar_truncation_t(xv, dxv, n, p_plane))
+            if budget_on:
+                # Budget the post-truncation movers on near pairs too (a
+                # fingertip eviction step can cross a gap slightly ABOVE
+                # d_offset) -- only while a grab is active (see budget_on):
+                # without one, pushes alone cannot cross a c >= 0 pair.
+                # Fully-pinned opponent exemption: see the c<0 branch note.
+                if not (inv_mass[i0] == 0.0 and inv_mass[i1] == 0.0
+                        and inv_mass[i2] == 0.0):
+                    wp.atomic_min(push_limit, v, farGuardKappa * d)
+                if inv_mass[i0] != 0.0:
+                    wp.atomic_min(push_limit, i0, farGuardKappa * d)
+                if inv_mass[i1] != 0.0:
+                    wp.atomic_min(push_limit, i1, farGuardKappa * d)
+                if inv_mass[i2] != 0.0:
+                    wp.atomic_min(push_limit, i2, farGuardKappa * d)
+            # Pinned triangle vertices cannot be truncated; with the pre-contact
+            # flag on, record how far their substep displacement would overshoot
+            # the shared plane as pressure (sim-inert; back-off direction -n).
+            # With GRAB_EVADE also on, reassign the worst pinned overshoot to
+            # the free vertex v as an immediate evasion along +n (v holds the
+            # contact point on its side, weight 1): the plane recedes by m, so
+            # v retreats by m -- the patch pushes v out of its own path.
+            m_ev = float(0.0)
             if inv_mass[i0] != 0.0:
                 wp.atomic_min(truncation_ts, i0, Cloth.planar_truncation_t(p0, dt0, -n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                m0 = (1.0 - Cloth.planar_truncation_t(p0, dt0, -n, p_plane)) \
+                    * wp.max(wp.dot(n, dt0), 0.0)
+                if m0 > 0.0:
+                    wp.atomic_add(push, i0, -m0 * n)
+                    m_ev = wp.max(m_ev, m0)
             if inv_mass[i1] != 0.0:
                 wp.atomic_min(truncation_ts, i1, Cloth.planar_truncation_t(p1, dt1, -n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                m1 = (1.0 - Cloth.planar_truncation_t(p1, dt1, -n, p_plane)) \
+                    * wp.max(wp.dot(n, dt1), 0.0)
+                if m1 > 0.0:
+                    wp.atomic_add(push, i1, -m1 * n)
+                    m_ev = wp.max(m_ev, m1)
             if inv_mass[i2] != 0.0:
                 wp.atomic_min(truncation_ts, i2, Cloth.planar_truncation_t(p2, dt2, -n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                m2 = (1.0 - Cloth.planar_truncation_t(p2, dt2, -n, p_plane)) \
+                    * wp.max(wp.dot(n, dt2), 0.0)
+                if m2 > 0.0:
+                    wp.atomic_add(push, i2, -m2 * n)
+                    m_ev = wp.max(m_ev, m2)
+            if GRAB_EVADE != 0 and m_ev > 0.0:
+                wp.atomic_add(push, v, (grabEvadeGain * m_ev) * n)
 
     @staticmethod
     @wp.kernel(launch_bounds=(256, 4))  # cap regs (~80->64) -> 4 blocks/SM (67% occ) for
@@ -1739,8 +2729,11 @@ class Cloth(Input):
             edge_ids: wp.array2d(dtype=wp.int32),  # [numEdges, 2], va < vb
             ee_count: wp.array(dtype=wp.int32),    # cached candidate counts (detect_expand)
             ee_buf: wp.array(dtype=wp.int32),      # cached candidate EDGE ids
+            n_grabs: wp.array(dtype=wp.int32),     # active grab count (c>=0 budget gate)
+            crossed: wp.array(dtype=wp.int32),     # exact crossed-vertex flags (see FLAG_GUARD)
             truncation_ts: wp.array(dtype=float),  # pre-filled with 1.0 (atomic_min)
-            push: wp.array(dtype=wp.vec3)):        # pre-zeroed C<0 recovery (atomic_add)
+            push: wp.array(dtype=wp.vec3),         # pre-zeroed C<0 recovery (atomic_add)
+            push_limit: wp.array(dtype=float)):    # crossing budget (atomic_min, see FAR_GUARD)
         # Edge-edge NARROWPHASE (query-free): iterate the cached candidate EDGES
         # (detect_expand did the broadphase, the shared-vertex/2-ring culls and the dedup)
         # and do the DIVIDE/TRUNCATE. Catches folds where two edges cross with no vertex
@@ -1756,6 +2749,9 @@ class Cloth(Input):
         wb = inv_mass[vb]
         if wa == 0.0 and wb == 0.0:
             return  # both endpoints host-driven
+
+        # c >= 0 budget writes gated on an active grab (see the VT kernel).
+        budget_on = FAR_GUARD != 0 and n_grabs[0] > 0
 
         xa = prev_pos[va]
         xb = prev_pos[vb]
@@ -1800,24 +2796,634 @@ class Cloth(Input):
                 # OWN endpoints apart (weighted by the reference barycentric coord). The
                 # two threads' (1 - lmbd) weights are complementary, so the pair
                 # separates by ~depth without an atomic_add cross-push double-count.
+                # If the CANDIDATE edge is fully pinned (a dragged grab patch), its
+                # thread early-outs and its complementary lmbd share is never
+                # delivered -- the free edge would receive as little as 5% of the
+                # separation per substep (guaranteed crossing under a pinned plow).
+                # Take the full correction on this side instead.
                 depth = -c
-                if wa != 0.0:
-                    wp.atomic_add(push, va, (1.0 - lmbd) * depth * (1.0 - se) * n)
-                if wb != 0.0:
-                    wp.atomic_add(push, vb, (1.0 - lmbd) * depth * se * n)
+                if inv_mass[vc] == 0.0 and inv_mass[vd] == 0.0:
+                    lmbd = 0.0
+                    # Fully pinned candidate edge (a dragged grab patch): its own
+                    # thread early-outed, so no thread records the plow load on
+                    # it -- write the candidate side's undelivered share as a
+                    # pressure signal (sim-inert: apply_truncation skips pinned).
+                    wp.atomic_add(push, vc, -depth * (1.0 - sf) * n)
+                    wp.atomic_add(push, vd, -depth * sf * n)
+                elif GRAB_EVADE != 0 and (inv_mass[vc] == 0.0 or inv_mass[vd] == 0.0):
+                    # PARTIALLY pinned candidate (the grab patch RIM): its own
+                    # thread delivers its lmbd share with barycentric weights,
+                    # and the pinned endpoint's portion of that is sim-inert --
+                    # take exactly that undeliverable portion on this side
+                    # (lmbd_eff = lmbd * delivered fraction; the mirrored
+                    # thread's own-endpoint-only writes keep the pair total at
+                    # depth with no double count). Per-vertex generalization of
+                    # the fully-pinned rule above, which it reproduces at
+                    # extra = 1.
+                    extra = float(0.0)
+                    if inv_mass[vc] == 0.0:
+                        extra += 1.0 - sf
+                    if inv_mass[vd] == 0.0:
+                        extra += sf
+                    lmbd = lmbd * (1.0 - extra)
+                # Unguarded own-endpoint writes: a free endpoint takes its usual
+                # share; a pinned one records it as pressure (sim-inert).
+                wp.atomic_add(push, va, (1.0 - lmbd) * depth * (1.0 - se) * n)
+                wp.atomic_add(push, vb, (1.0 - lmbd) * depth * se * n)
+                if FAR_GUARD != 0:
+                    # CROSSING BUDGET (see FAR_GUARD and the VT branch).
+                    # Fully-pinned candidate exemption for the va/vb budget:
+                    # against a dragged patch the bounded push is the only
+                    # separator -- keep its bandwidth. vc/vd keep the budget
+                    # (their opponent e has a free endpoint here, or this
+                    # thread would have early-outed).
+                    cand_pinned = inv_mass[vc] == 0.0 and inv_mass[vd] == 0.0
+                    if wa != 0.0 and not cand_pinned:
+                        wp.atomic_min(push_limit, va, farGuardKappa * d)
+                    if wb != 0.0 and not cand_pinned:
+                        wp.atomic_min(push_limit, vb, farGuardKappa * d)
+                    if inv_mass[vc] != 0.0:
+                        wp.atomic_min(push_limit, vc, farGuardKappa * d)
+                    if inv_mass[vd] != 0.0:
+                        wp.atomic_min(push_limit, vd, farGuardKappa * d)
+                    bar_floor = farBarrierFloor
+                    if FLAG_GUARD != 0 and n_grabs[0] > 0 \
+                            and crossed[va] == 0 and crossed[vb] == 0 \
+                            and crossed[vc] == 0 and crossed[vd] == 0:
+                        # Side-aware floor (see FLAG_GUARD and the VT branch).
+                        bar_floor = farBarrierEps
+                    if d > bar_floor * d_offset:
+                        # CROSSING BARRIER, floor-gated against wrong-side
+                        # locking of already-crossed pairs (see the VT
+                        # branch): truncate every free endpoint against the
+                        # remaining-gap split plane (planar_truncation_t is
+                        # sign-symmetric in n). All four endpoints, like the
+                        # c >= 0 path: one-sided discovery must protect both
+                        # edges.
+                        p_bar = cb + (lmbd * d) * n
+                        if wa != 0.0:
+                            wp.atomic_min(truncation_ts, va,
+                                          Cloth.planar_truncation_t(xa, d_va, n, p_bar))
+                        if wb != 0.0:
+                            wp.atomic_min(truncation_ts, vb,
+                                          Cloth.planar_truncation_t(xb, d_vb, n, p_bar))
+                        if inv_mass[vc] != 0.0:
+                            wp.atomic_min(truncation_ts, vc,
+                                          Cloth.planar_truncation_t(yc, d_vc, n, p_bar))
+                        if inv_mass[vd] != 0.0:
+                            wp.atomic_min(truncation_ts, vd,
+                                          Cloth.planar_truncation_t(yd, d_vd, n, p_bar))
                 continue
 
             # TRUNCATE: each endpoint against the shared plane by its own displacement
             # (planar_truncation_t is sign-symmetric in n, so both sides use +n).
             p_plane = cb + (d_offset + lmbd * c) * n
+            if budget_on:
+                # Crossing budget on near pairs, grab-gated (see the VT
+                # branch notes, incl. the fully-pinned candidate exemption).
+                if not (inv_mass[vc] == 0.0 and inv_mass[vd] == 0.0):
+                    if wa != 0.0:
+                        wp.atomic_min(push_limit, va, farGuardKappa * d)
+                    if wb != 0.0:
+                        wp.atomic_min(push_limit, vb, farGuardKappa * d)
+                if inv_mass[vc] != 0.0:
+                    wp.atomic_min(push_limit, vc, farGuardKappa * d)
+                if inv_mass[vd] != 0.0:
+                    wp.atomic_min(push_limit, vd, farGuardKappa * d)
+            # Pinned endpoints cannot be truncated; with the pre-contact flag on,
+            # record their would-be plane overshoot as pressure (sim-inert).
+            # Own side approaches along -n (back-off +n); candidate along +n.
             if wa != 0.0:
                 wp.atomic_min(truncation_ts, va, Cloth.planar_truncation_t(xa, d_va, n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                ma = (1.0 - Cloth.planar_truncation_t(xa, d_va, n, p_plane)) \
+                    * wp.max(-wp.dot(n, d_va), 0.0)
+                if ma > 0.0:
+                    wp.atomic_add(push, va, ma * n)
             if wb != 0.0:
                 wp.atomic_min(truncation_ts, vb, Cloth.planar_truncation_t(xb, d_vb, n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                mb = (1.0 - Cloth.planar_truncation_t(xb, d_vb, n, p_plane)) \
+                    * wp.max(-wp.dot(n, d_vb), 0.0)
+                if mb > 0.0:
+                    wp.atomic_add(push, vb, mb * n)
+            # GRAB_EVADE: gather the CANDIDATE side's pinned overshoot at the
+            # contact point (barycentric mix at sf; a free candidate endpoint
+            # is truncated, so its overshoot is 0) and reassign it to the OWN
+            # free endpoints below -- own-endpoint-only writes, so the
+            # mirrored discovery (if any) cannot double-deliver.
+            m_cand = float(0.0)
             if inv_mass[vc] != 0.0:
                 wp.atomic_min(truncation_ts, vc, Cloth.planar_truncation_t(yc, d_vc, n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                mc = (1.0 - Cloth.planar_truncation_t(yc, d_vc, n, p_plane)) \
+                    * wp.max(wp.dot(n, d_vc), 0.0)
+                if mc > 0.0:
+                    wp.atomic_add(push, vc, -mc * n)
+                    m_cand += (1.0 - sf) * mc
             if inv_mass[vd] != 0.0:
                 wp.atomic_min(truncation_ts, vd, Cloth.planar_truncation_t(yd, d_vd, n, p_plane))
+            elif GRAB_YIELD_PRECONTACT != 0:
+                md = (1.0 - Cloth.planar_truncation_t(yd, d_vd, n, p_plane)) \
+                    * wp.max(wp.dot(n, d_vd), 0.0)
+                if md > 0.0:
+                    wp.atomic_add(push, vd, -md * n)
+                    m_cand += sf * md
+            if GRAB_EVADE != 0 and m_cand > 0.0:
+                # The candidate's contact point invades the own side by m_cand
+                # along +n; the own free endpoints absorb it with the same
+                # barycentric share split the c<0 recovery uses. Pinned own
+                # endpoints take theirs as pressure (the write below would be
+                # sim-inert anyway, but their share is genuinely undeliverable
+                # -- leave it to the yield stall).
+                ev = grabEvadeGain * m_cand
+                if wa != 0.0:
+                    wp.atomic_add(push, va, (ev * (1.0 - se)) * n)
+                if wb != 0.0:
+                    wp.atomic_add(push, vb, (ev * se) * n)
+
+    @staticmethod
+    @wp.kernel
+    def rim_truncate_vt(
+            inv_mass: wp.array(dtype=float),
+            prev_pos: wp.array(dtype=wp.vec3),      # frozen reference state X
+            pos: wp.array(dtype=wp.vec3),           # X + accumulated displacement
+            pairs: wp.array2d(dtype=wp.int32),      # [maxRimVT, 4] = (v, i0, i1, i2)
+            count: wp.array(dtype=wp.int32),
+            truncation_ts: wp.array(dtype=float),   # shared with the main narrowphase
+            push: wp.array(dtype=wp.vec3)):
+        # Rim vertex-face DIVIDE/TRUNCATE (see RIM_SOLVER): the standard PDT
+        # plane on an explicit grab-rim pair list, at the REDUCED separation
+        # rimDOffset, with every pinned share/overshoot reassigned to the free
+        # side. One thread per pair (the list has no mirrored duplicates), no
+        # pressure recording on pinned slots (grip yield unchanged).
+        if RIM_SOLVER == 0:
+            return
+        t = wp.tid()
+        if t >= count[0]:
+            return
+        v = pairs[t, 0]
+        i0 = pairs[t, 1]
+        i1 = pairs[t, 2]
+        i2 = pairs[t, 3]
+        wv = inv_mass[v]
+        w0 = inv_mass[i0]
+        w1 = inv_mass[i1]
+        w2 = inv_mass[i2]
+
+        xv = prev_pos[v]
+        dxv = pos[v] - xv
+        p0 = prev_pos[i0]
+        p1 = prev_pos[i1]
+        p2 = prev_pos[i2]
+        cp = Cloth.closest_point_on_triangle(p0, p1, p2, xv)
+        n_hat = xv - cp
+        d = wp.length(n_hat)
+        if d < epsilon:
+            return
+        n = n_hat / d
+        c = d - rimDOffsetVT
+
+        dt0 = pos[i0] - p0
+        dt1 = pos[i1] - p1
+        dt2 = pos[i2] - p2
+
+        delta_v_n = wp.max(-wp.dot(n, dxv), 0.0)
+        delta_t_n = wp.max(wp.max(wp.dot(n, dt0), wp.dot(n, dt1)),
+                           wp.max(wp.dot(n, dt2), 0.0))
+        s = delta_v_n + delta_t_n
+        if s == 0.0:
+            lmbd = 0.5
+        else:
+            lmbd = wp.clamp(delta_t_n / s, 0.05, 0.95)
+
+        nf_t = float(0.0)  # free face-vertex count
+        if w0 != 0.0:
+            nf_t += 1.0
+        if w1 != 0.0:
+            nf_t += 1.0
+        if w2 != 0.0:
+            nf_t += 1.0
+
+        if c < 0.0:
+            # Feasibility recovery at the rim: one-sided push toward rimDOffset.
+            # Pinned shares are undeliverable -- reassign them across the pair
+            # so the RELATIVE separation stays ~depth (the c<0 lmbd rules'
+            # generalization; the pair list has no mirror thread, so this
+            # thread delivers both sides).
+            depth = -c
+            tp = lmbd * depth / 3.0
+            v_share = (1.0 - lmbd) * depth
+            t_undeliv = (3.0 - nf_t) * tp
+            extra_t = float(0.0)
+            if wv != 0.0:
+                wp.atomic_add(push, v, (v_share + t_undeliv) * n)
+            else:
+                if nf_t == 0.0:
+                    return  # fully pinned pair: nothing can move
+                extra_t = (v_share + t_undeliv) / nf_t
+            if w0 != 0.0:
+                wp.atomic_add(push, i0, -(tp + extra_t) * n)
+            if w1 != 0.0:
+                wp.atomic_add(push, i1, -(tp + extra_t) * n)
+            if w2 != 0.0:
+                wp.atomic_add(push, i2, -(tp + extra_t) * n)
+            return
+
+        # TRUNCATE free vertices against the shared plane; a pinned vertex
+        # cannot be truncated, so its plane overshoot (it WILL cross by this
+        # much -- pinned motion ignores planes) is delivered to the free side
+        # as an immediate evasion displacement, GRAB_EVADE-style: the plane
+        # effectively recedes by m, so the free side retreats by m within the
+        # same substep instead of being crossed next substep.
+        p_plane = cp + (rimDOffsetVT + lmbd * c) * n
+        tv = Cloth.planar_truncation_t(xv, dxv, n, p_plane)
+        m_v = float(0.0)   # pinned v overshoot -> free face vertices
+        if wv != 0.0:
+            wp.atomic_min(truncation_ts, v, tv)
+        else:
+            m_v = (1.0 - tv) * wp.max(-wp.dot(n, dxv), 0.0)
+        m_t = float(0.0)   # worst pinned face-vertex overshoot -> v
+        t0 = Cloth.planar_truncation_t(p0, dt0, n, p_plane)
+        if w0 != 0.0:
+            wp.atomic_min(truncation_ts, i0, t0)
+        else:
+            m_t = wp.max(m_t, (1.0 - t0) * wp.max(wp.dot(n, dt0), 0.0))
+        t1 = Cloth.planar_truncation_t(p1, dt1, n, p_plane)
+        if w1 != 0.0:
+            wp.atomic_min(truncation_ts, i1, t1)
+        else:
+            m_t = wp.max(m_t, (1.0 - t1) * wp.max(wp.dot(n, dt1), 0.0))
+        t2 = Cloth.planar_truncation_t(p2, dt2, n, p_plane)
+        if w2 != 0.0:
+            wp.atomic_min(truncation_ts, i2, t2)
+        else:
+            m_t = wp.max(m_t, (1.0 - t2) * wp.max(wp.dot(n, dt2), 0.0))
+        if wv != 0.0 and m_t > 0.0:
+            wp.atomic_add(push, v, m_t * n)
+        if m_v > 0.0 and nf_t > 0.0:
+            if w0 != 0.0:
+                wp.atomic_add(push, i0, -m_v * n)
+            if w1 != 0.0:
+                wp.atomic_add(push, i1, -m_v * n)
+            if w2 != 0.0:
+                wp.atomic_add(push, i2, -m_v * n)
+
+    @staticmethod
+    @wp.kernel
+    def rim_truncate_ee(
+            inv_mass: wp.array(dtype=float),
+            prev_pos: wp.array(dtype=wp.vec3),      # frozen reference state X
+            pos: wp.array(dtype=wp.vec3),           # X + accumulated displacement
+            pairs: wp.array2d(dtype=wp.int32),      # [maxRimEE, 4] = (va, vb, vc, vd)
+            count: wp.array(dtype=wp.int32),
+            truncation_ts: wp.array(dtype=float),   # shared with the main narrowphase
+            push: wp.array(dtype=wp.vec3)):
+        # Rim edge-edge DIVIDE/TRUNCATE (see RIM_SOLVER): per-endpoint
+        # truncation against the shared frozen-closest-point plane at the
+        # reduced rim separation. One thread per unordered pair, so this
+        # thread delivers BOTH sides' c<0 shares (barycentric weights, pinned
+        # shares redistributed within the side, a fully pinned side's share
+        # folded into the other side) -- no mirrored-discovery double count.
+        if RIM_SOLVER == 0:
+            return
+        t = wp.tid()
+        if t >= count[0]:
+            return
+        va = pairs[t, 0]
+        vb = pairs[t, 1]
+        vc = pairs[t, 2]
+        vd = pairs[t, 3]
+        wa = inv_mass[va]
+        wb = inv_mass[vb]
+        wc = inv_mass[vc]
+        wd = inv_mass[vd]
+
+        xa = prev_pos[va]
+        xb = prev_pos[vb]
+        yc = prev_pos[vc]
+        yd = prev_pos[vd]
+        ca, cb, se, sf = Cloth.closest_point_segment_segment(xa, xb, yc, yd)
+        n_hat = ca - cb
+        d = wp.length(n_hat)
+        if d < epsilon:
+            return
+        n = n_hat / d
+        c = d - rimDOffsetEE
+
+        d_va = pos[va] - xa
+        d_vb = pos[vb] - xb
+        d_vc = pos[vc] - yc
+        d_vd = pos[vd] - yd
+
+        delta_e_n = wp.max(wp.max(-wp.dot(n, d_va), -wp.dot(n, d_vb)), 0.0)
+        delta_f_n = wp.max(wp.max(wp.dot(n, d_vc), wp.dot(n, d_vd)), 0.0)
+        ssum = delta_e_n + delta_f_n
+        if ssum == 0.0:
+            lmbd = 0.5
+        else:
+            lmbd = wp.clamp(delta_f_n / ssum, 0.05, 0.95)
+
+        if c < 0.0:
+            depth = -c
+            share_e = (1.0 - lmbd) * depth
+            share_f = lmbd * depth
+            fe = float(0.0)   # deliverable barycentric weight, e side
+            if wa != 0.0:
+                fe += 1.0 - se
+            if wb != 0.0:
+                fe += se
+            ff = float(0.0)   # deliverable barycentric weight, f side
+            if wc != 0.0:
+                ff += 1.0 - sf
+            if wd != 0.0:
+                ff += sf
+            if fe == 0.0 and ff == 0.0:
+                return
+            if fe == 0.0:
+                share_f += share_e
+                share_e = 0.0
+            if ff == 0.0:
+                share_e += share_f
+                share_f = 0.0
+            if share_e > 0.0 and fe > 0.0:
+                if wa != 0.0:
+                    wp.atomic_add(push, va, (share_e * (1.0 - se) / fe) * n)
+                if wb != 0.0:
+                    wp.atomic_add(push, vb, (share_e * se / fe) * n)
+            if share_f > 0.0 and ff > 0.0:
+                if wc != 0.0:
+                    wp.atomic_add(push, vc, -(share_f * (1.0 - sf) / ff) * n)
+                if wd != 0.0:
+                    wp.atomic_add(push, vd, -(share_f * sf / ff) * n)
+            return
+
+        # TRUNCATE each free endpoint by its own displacement; pinned-endpoint
+        # plane overshoots are gathered per side (barycentric mix, like the
+        # main EE evade) and delivered to the OTHER side's free endpoints.
+        p_plane = cb + (rimDOffsetEE + lmbd * c) * n
+        m_e = float(0.0)   # e-side pinned overshoot (approach along -n)
+        ta = Cloth.planar_truncation_t(xa, d_va, n, p_plane)
+        if wa != 0.0:
+            wp.atomic_min(truncation_ts, va, ta)
+        else:
+            m_e += (1.0 - se) * (1.0 - ta) * wp.max(-wp.dot(n, d_va), 0.0)
+        tb = Cloth.planar_truncation_t(xb, d_vb, n, p_plane)
+        if wb != 0.0:
+            wp.atomic_min(truncation_ts, vb, tb)
+        else:
+            m_e += se * (1.0 - tb) * wp.max(-wp.dot(n, d_vb), 0.0)
+        m_f = float(0.0)   # f-side pinned overshoot (approach along +n)
+        tc = Cloth.planar_truncation_t(yc, d_vc, n, p_plane)
+        if wc != 0.0:
+            wp.atomic_min(truncation_ts, vc, tc)
+        else:
+            m_f += (1.0 - sf) * (1.0 - tc) * wp.max(wp.dot(n, d_vc), 0.0)
+        td = Cloth.planar_truncation_t(yd, d_vd, n, p_plane)
+        if wd != 0.0:
+            wp.atomic_min(truncation_ts, vd, td)
+        else:
+            m_f += sf * (1.0 - td) * wp.max(wp.dot(n, d_vd), 0.0)
+        if m_f > 0.0:
+            if wa != 0.0:
+                wp.atomic_add(push, va, (m_f * (1.0 - se)) * n)
+            if wb != 0.0:
+                wp.atomic_add(push, vb, (m_f * se) * n)
+        if m_e > 0.0:
+            if wc != 0.0:
+                wp.atomic_add(push, vc, -(m_e * (1.0 - sf)) * n)
+            if wd != 0.0:
+                wp.atomic_add(push, vd, -(m_e * sf) * n)
+
+    @staticmethod
+    @wp.kernel(launch_bounds=(256, 4))
+    def contact_repulsion(
+            tri_ids: wp.array2d(dtype=wp.int32),
+            inv_mass: wp.array(dtype=float),
+            pos: wp.array(dtype=wp.vec3),          # CURRENT positions (not the frozen reference)
+            prev_pos: wp.array(dtype=wp.vec3),     # frozen reference (approach gate only)
+            vt_count: wp.array(dtype=wp.int32),    # cached candidate counts (detect_expand, read-only)
+            vt_buf: wp.array(dtype=wp.int32),      # cached candidate tri ids (read-only)
+            deltas: wp.array(dtype=wp.vec3)):      # pre-zeroed, applied by add_deltas
+        # Unilateral vertex-triangle contact repulsion: soft pressure between
+        # candidate pairs closer than the engage distance, pushing them apart
+        # along the current closest-point direction. This is a FORCE-like pass,
+        # not a PDT plane: it reads current geometry only, so there is no
+        # reference-state contract to honor, and the truncation narrowphase runs
+        # AFTER it in the substep and truncates any resulting crossing among
+        # candidate pairs. Step-capped (repulsionCap <= 0.5*d_offset) so a
+        # feasible-start pair (gap >= d_offset) can never be pushed across a
+        # neighboring sheet in one pass.
+        v = wp.tid()
+        if inv_mass[v] == 0.0:
+            return  # pinned targets get pressure only via the c<0 push signal
+        xv = pos[v]
+        engage = repulsionEngage * d_offset
+        n_cand = wp.min(vt_count[v], maxVT)
+        base = v * maxVT
+        for kc in range(n_cand):
+            face = vt_buf[base + kc]
+            i0 = tri_ids[face, 0]
+            i1 = tri_ids[face, 1]
+            i2 = tri_ids[face, 2]
+            cp = Cloth.closest_point_on_triangle(pos[i0], pos[i1], pos[i2], xv)
+            n_hat = xv - cp
+            d = wp.length(n_hat)
+            if d < epsilon or d >= engage:
+                continue
+            n = n_hat / d
+            corr = wp.min(repulsionK * (engage - d), repulsionCap)
+            if REPULSION_APPROACH != 0:
+                xpv = prev_pos[v]
+                cpp = Cloth.closest_point_on_triangle(
+                    prev_pos[i0], prev_pos[i1], prev_pos[i2], xpv)
+                if wp.length(xpv - cpp) - d <= repulsionApproachEps:
+                    corr = corr * repulsionSepGain  # not approaching: soften
+                    if corr <= 0.0:
+                        continue
+            # Split the separation between the two sides; if the triangle side
+            # is fully pinned its share is undeliverable -- reassign it to the
+            # vertex (same rule as the c<0 push).
+            lmbd = 0.5
+            if inv_mass[i0] == 0.0 and inv_mass[i1] == 0.0 and inv_mass[i2] == 0.0:
+                lmbd = 0.0
+            wp.atomic_add(deltas, v, ((1.0 - lmbd) * corr) * n)
+            tp = lmbd * corr / 3.0
+            if inv_mass[i0] != 0.0:
+                wp.atomic_add(deltas, i0, -tp * n)
+            if inv_mass[i1] != 0.0:
+                wp.atomic_add(deltas, i1, -tp * n)
+            if inv_mass[i2] != 0.0:
+                wp.atomic_add(deltas, i2, -tp * n)
+            if frictionMu > 0.0 and d < frictionEngage * d_offset \
+                    and d > frictionFloor * d_offset:
+                # Coulomb grip on PRESSED contacts only: damp the relative
+                # tangential slip over the detection window, budgeted by the
+                # normal correction (cap = mu * corr). Barycentric weights of
+                # the CURRENT closest point applied to prev positions estimate
+                # the face's motion -- no second triangle solve.
+                e0 = pos[i1] - pos[i0]
+                e1 = pos[i2] - pos[i0]
+                cv = cp - pos[i0]
+                d00 = wp.dot(e0, e0)
+                d01 = wp.dot(e0, e1)
+                d11 = wp.dot(e1, e1)
+                den = d00 * d11 - d01 * d01
+                w1 = 0.0
+                w2 = 0.0
+                if den > epsilon:
+                    w1 = (d11 * wp.dot(cv, e0) - d01 * wp.dot(cv, e1)) / den
+                    w2 = (d00 * wp.dot(cv, e1) - d01 * wp.dot(cv, e0)) / den
+                w0 = 1.0 - w1 - w2
+                face_dv = w0 * (pos[i0] - prev_pos[i0]) \
+                    + w1 * (pos[i1] - prev_pos[i1]) \
+                    + w2 * (pos[i2] - prev_pos[i2])
+                rel = (xv - prev_pos[v]) - face_dv
+                rel_t = rel - wp.dot(rel, n) * n
+                st = wp.length(rel_t)
+                if st > epsilon:
+                    fmag = wp.min(st, frictionMu * corr)
+                    fvec = rel_t * (fmag / st)
+                    wp.atomic_add(deltas, v, -(1.0 - lmbd) * fvec)
+                    fp = lmbd / 3.0
+                    if inv_mass[i0] != 0.0:
+                        wp.atomic_add(deltas, i0, fp * fvec)
+                    if inv_mass[i1] != 0.0:
+                        wp.atomic_add(deltas, i1, fp * fvec)
+                    if inv_mass[i2] != 0.0:
+                        wp.atomic_add(deltas, i2, fp * fvec)
+
+    @staticmethod
+    @wp.kernel(launch_bounds=(256, 4))
+    def contact_repulsion_edges(
+            inv_mass: wp.array(dtype=float),
+            pos: wp.array(dtype=wp.vec3),          # CURRENT positions
+            prev_pos: wp.array(dtype=wp.vec3),     # frozen reference (approach gate only)
+            edge_ids: wp.array2d(dtype=wp.int32),  # [numEdges, 2]
+            ee_count: wp.array(dtype=wp.int32),    # cached candidate counts (read-only)
+            ee_buf: wp.array(dtype=wp.int32),      # cached candidate EDGE ids (read-only)
+            deltas: wp.array(dtype=wp.vec3)):      # shared pre-zeroed accumulator
+        # Edge-edge companion of contact_repulsion (the "X" crossing config that
+        # has no vertex near either face). Same structure as the truncate_edges
+        # c<0 push: each thread displaces only its OWN endpoints (barycentric
+        # split), the twin thread's complementary share covers the other edge
+        # when discovery is two-sided; one-sided discovery still separates the
+        # pair at half rate.
+        e = wp.tid()
+        va = edge_ids[e, 0]
+        vb = edge_ids[e, 1]
+        wa = inv_mass[va]
+        wb = inv_mass[vb]
+        if wa == 0.0 and wb == 0.0:
+            return
+        xa = pos[va]
+        xb = pos[vb]
+        engage = repulsionEngage * d_offset
+        n_cand = wp.min(ee_count[e], maxEE)
+        ebase = e * maxEE
+        for ci in range(n_cand):
+            f = ee_buf[ebase + ci]
+            vc = edge_ids[f, 0]
+            vd = edge_ids[f, 1]
+            ca, cb, se, sf = Cloth.closest_point_segment_segment(xa, xb, pos[vc], pos[vd])
+            n_hat = ca - cb
+            d = wp.length(n_hat)
+            if d < epsilon or d >= engage:
+                continue
+            n = n_hat / d
+            corr = wp.min(repulsionK * (engage - d), repulsionCap)
+            if REPULSION_APPROACH != 0:
+                cpa, cpb, spe, spf = Cloth.closest_point_segment_segment(
+                    prev_pos[va], prev_pos[vb], prev_pos[vc], prev_pos[vd])
+                if wp.length(cpa - cpb) - d <= repulsionApproachEps:
+                    corr = corr * repulsionSepGain  # not approaching: soften
+                    if corr <= 0.0:
+                        continue
+            lmbd = 0.5
+            if inv_mass[vc] == 0.0 and inv_mass[vd] == 0.0:
+                lmbd = 0.0  # opposing side pinned: take the full separation here
+            if wa != 0.0:
+                wp.atomic_add(deltas, va, ((1.0 - lmbd) * corr * (1.0 - se)) * n)
+            if wb != 0.0:
+                wp.atomic_add(deltas, vb, ((1.0 - lmbd) * corr * se) * n)
+            if frictionMu > 0.0 and d < frictionEngage * d_offset \
+                    and d > frictionFloor * d_offset:
+                # Coulomb slip damping at PRESSED contact points, own endpoints
+                # only (barycentric split; twin thread covers the other edge).
+                own = xa + se * (xb - xa)
+                own_p = prev_pos[va] + se * (prev_pos[vb] - prev_pos[va])
+                oth = pos[vc] + sf * (pos[vd] - pos[vc])
+                oth_p = prev_pos[vc] + sf * (prev_pos[vd] - prev_pos[vc])
+                rel = (own - own_p) - (oth - oth_p)
+                rel_t = rel - wp.dot(rel, n) * n
+                st = wp.length(rel_t)
+                if st > epsilon:
+                    fmag = wp.min(st, frictionMu * corr)
+                    fvec = rel_t * (fmag / st)
+                    if wa != 0.0:
+                        wp.atomic_add(deltas, va, -((1.0 - lmbd) * (1.0 - se)) * fvec)
+                    if wb != 0.0:
+                        wp.atomic_add(deltas, vb, -((1.0 - lmbd) * se) * fvec)
+
+    @staticmethod
+    @wp.kernel
+    def pinch_extrude(
+            inv_mass: wp.array(dtype=float),
+            pos: wp.array(dtype=wp.vec3),          # CURRENT positions
+            center: wp.array(dtype=wp.vec3),       # CURRENT substep sphere center
+            radius: wp.array(dtype=float),
+            dc_arr: wp.array(dtype=wp.vec3),       # PER-SUBSTEP sphere translation
+            dr_arr: wp.array(dtype=float),         # PER-SUBSTEP radius change
+            vt_count: wp.array(dtype=wp.int32),    # candidate-face counts (stack pressure proxy)
+            deltas: wp.array(dtype=wp.vec3)):      # pre-zeroed, applied by add_deltas
+        # Pinch-wedge lateral extrusion (see the extrudeGain constants note):
+        # fabric squeezed under a descending or floor-parked shell has only
+        # near-vertical contact normals -- no subsystem transports it sideways,
+        # so an overfull stack (more layers than the closing shell/pool or
+        # shell/floor wedge can hold) pancakes to ~zero gap, where every
+        # post-PDT writer's step exceeds the layer spacing and the layer order
+        # scrambles (the permanent knots). Give particles under REAL stacking
+        # pressure (vt_count from this substep's detect pass) whose overhead
+        # shell clearance is closing a bounded horizontal step away from the
+        # sphere axis -- out of the wedge, toward where the shell curves up.
+        # Runs pre-narrowphase so the PDT planes veto any step that would
+        # cross a sheet (fabric stops at fold walls instead of punching
+        # through). Inert when the sphere hovers, rests high (hammock), or the
+        # local stack is 1-2 layers.
+        i = wp.tid()
+        if COLLIDER_KIND != 0:
+            return  # sphere-crush-specific geometry: compiled out for the rod
+        if inv_mass[i] == 0.0:
+            return
+        if vt_count[i] < extrudePressure:
+            return
+        c_end = center[0] + dc_arr[0]
+        r_end = radius[0] + dr_arr[0] + thickness
+        # Engage only while the wedge is CLOSING: the shell descends, grows, or
+        # is already parked at its floor clamp. A sphere resting statically in
+        # a draped hammock keeps its wrap.
+        if (dc_arr[0][1] >= 0.0 and dr_arr[0] <= 0.0
+                and c_end[1] - r_end >= thickness + extrudeBand):
+            return
+        x = pos[i]
+        if x[1] >= c_end[1]:
+            return  # above the sphere equator: not in a closing wedge
+        # Engage in a radial band around the LOWER shell surface: covers both
+        # the floor corridor (fabric under the shell bottom) and the flank
+        # wedge (fabric pressed between the diagonal shell and the pool during
+        # the descent -- where the crush wads actually form). The horizontal
+        # outward step is ~tangent on the flank, pointing out of the wedge.
+        dvs = x - c_end
+        d_sh = wp.length(dvs) - r_end
+        if d_sh < -2.0 * d_offset or d_sh > extrudeBand:
+            return
+        hx = dvs[0]
+        hz = dvs[2]
+        hd2 = hx * hx + hz * hz
+        if hd2 <= epsilon:
+            return  # exactly on the axis: no exit azimuth
+        s_ex = extrudeGain * projClamp / wp.sqrt(hd2)
+        wp.atomic_add(deltas, i, wp.vec3(s_ex * hx, 0.0, s_ex * hz))
 
     @staticmethod
     @wp.kernel
@@ -1945,12 +3551,179 @@ class Cloth(Input):
 
     @staticmethod
     @wp.kernel
+    def self_contact_gaps(
+            mesh: wp.uint64,
+            pos: wp.array(dtype=wp.vec3),
+            grid_rc: wp.array2d(dtype=wp.int32),
+            gaps: wp.array(dtype=float)):
+        # DIAGNOSTIC ONLY: per-vertex nearest non-ring vertex-triangle gap on the
+        # CURRENT geometry (host analysis of where separations are violated).
+        v = wp.tid()
+        xv = pos[v]
+        r = 2.0 * d_offset
+        query = wp.mesh_query_aabb(mesh, xv - wp.vec3(r, r, r), xv + wp.vec3(r, r, r))
+        best = float(1.0e30)
+        face = wp.int32(0)
+        while wp.mesh_query_aabb_next(query, face):
+            i0 = wp.mesh_get_index(mesh, 3 * face + 0)
+            i1 = wp.mesh_get_index(mesh, 3 * face + 1)
+            i2 = wp.mesh_get_index(mesh, 3 * face + 2)
+            if (Cloth.within_ring_rc(grid_rc, v, i0)
+                    or Cloth.within_ring_rc(grid_rc, v, i1)
+                    or Cloth.within_ring_rc(grid_rc, v, i2)):
+                continue
+            cp = Cloth.closest_point_on_triangle(pos[i0], pos[i1], pos[i2], xv)
+            best = wp.min(best, wp.length(xv - cp))
+        gaps[v] = best
+
+    @staticmethod
+    @wp.kernel
+    def detect_crossings(
+            grid: wp.uint64,                       # hash grid built on CURRENT pos
+            pos: wp.array(dtype=wp.vec3),
+            edge_ids: wp.array2d(dtype=wp.int32),  # [numEdges, 2]
+            tri_ids: wp.array2d(dtype=wp.int32),   # [numTris, 3]
+            grid_rc: wp.array2d(dtype=wp.int32),
+            vert_face_off: wp.array(dtype=wp.int32),
+            vert_face_ids: wp.array(dtype=wp.int32),
+            bounds: wp.array(dtype=float),         # [0] = longest current edge
+            pairs: wp.array2d(dtype=wp.int32),     # out: crossed (edge, face)
+            count: wp.array(dtype=wp.int32)):      # out: atomic append counter
+        # Crossing-resolver DETECTION (once per frame, outside the graph): exact
+        # segment-triangle intersections on the CURRENT geometry. A face
+        # intersected by this edge has its intersection point q within half the
+        # edge length of the edge midpoint, and some face vertex within the
+        # longest-edge bound L of q, so a grid walk of half + L from the
+        # midpoint reaches a vertex of every intersected face. Each face is
+        # tested once: only the minimum-id face vertex IN RANGE expands it.
+        # Faces sharing a vertex with the edge are skipped (adjacent geometry
+        # cannot legitimately "cross" its own edge), and so are 2-ring
+        # material neighbors (see the ring-cull note below -- those belong to
+        # SOLVER_RING prevention, not to flipping). Oversized (stretch-wad)
+        # primitives are skipped; the resolver targets settled/locked states,
+        # not mid-wad transients.
+        e = wp.tid()
+        va = edge_ids[e, 0]
+        vb = edge_ids[e, 1]
+        pa = pos[va]
+        pb = pos[vb]
+        d = pb - pa
+        half = 0.5 * wp.length(d)
+        if not (half < 0.5 * edgeLenCap):  # oversized or NaN edge: skip
+            return
+        L = wp.min(bounds[0], edgeLenCap)
+        mid = 0.5 * (pa + pb)
+        r = half + L + 1.0e-4
+        query = wp.hash_grid_query(grid, mid, r)
+        u = wp.int32(0)
+        while wp.hash_grid_query_next(query, u):
+            if wp.length(pos[u] - mid) > r:
+                continue
+            for k in range(vert_face_off[u], vert_face_off[u + 1]):
+                f = vert_face_ids[k]
+                i0 = tri_ids[f, 0]
+                i1 = tri_ids[f, 1]
+                i2 = tri_ids[f, 2]
+                if i0 == va or i0 == vb or i1 == va or i1 == vb \
+                        or i2 == va or i2 == vb:
+                    continue  # shares a vertex with the edge
+                # Ring cull (2-ring, matching the metric kernels): a crossing
+                # whose partner face is a material neighbor lives inside the
+                # constraint skeleton (distance edges, ring_floor pairs) --
+                # flipping there fights the constraints and oscillates
+                # (measured: WORSE 3003 residue with ring-local flips than
+                # without). Those are prevented by SOLVER_RING=1 and relaxed
+                # by bending/ring_floor; the resolver handles only true
+                # SHEET crossings (ring > 2), the class it reliably fixes.
+                if (Cloth.within_ring_rc(grid_rc, va, i0)
+                        or Cloth.within_ring_rc(grid_rc, va, i1)
+                        or Cloth.within_ring_rc(grid_rc, va, i2)
+                        or Cloth.within_ring_rc(grid_rc, vb, i0)
+                        or Cloth.within_ring_rc(grid_rc, vb, i1)
+                        or Cloth.within_ring_rc(grid_rc, vb, i2)):
+                    continue
+                # dedup: only the min-id face vertex IN RANGE processes f
+                m = u
+                if i0 != u and i0 < m and wp.length(pos[i0] - mid) <= r:
+                    m = i0
+                if i1 != u and i1 < m and wp.length(pos[i1] - mid) <= r:
+                    m = i1
+                if i2 != u and i2 < m and wp.length(pos[i2] - mid) <= r:
+                    m = i2
+                if m != u:
+                    continue
+                # exact Moller-Trumbore segment-triangle test
+                a0 = pos[i0]
+                e1 = pos[i1] - a0
+                e2 = pos[i2] - a0
+                h = wp.cross(d, e2)
+                det = wp.dot(e1, h)
+                if wp.abs(det) < 1.0e-14:
+                    continue
+                inv = 1.0 / det
+                s = pa - a0
+                bu = wp.dot(s, h) * inv
+                if bu < 0.0 or bu > 1.0:
+                    continue
+                q = wp.cross(s, e1)
+                bv = wp.dot(d, q) * inv
+                if bv < 0.0 or bu + bv > 1.0:
+                    continue
+                t = wp.dot(e2, q) * inv
+                if t <= 0.0 or t >= 1.0:
+                    continue
+                idx = wp.atomic_add(count, 0, 1)
+                if idx < maxCross:
+                    pairs[idx, 0] = e
+                    pairs[idx, 1] = f
+
+    @staticmethod
+    @wp.kernel
+    def scatter_crossed_flags(
+            pairs: wp.array2d(dtype=wp.int32),     # detect_crossings output
+            count: wp.array(dtype=wp.int32),
+            edge_ids: wp.array2d(dtype=wp.int32),
+            tri_ids: wp.array2d(dtype=wp.int32),
+            flags: wp.array(dtype=wp.int32)):      # pre-zeroed, 1 = crossed
+        # Crossed-flag scatter (see FLAG_GUARD): mark every vertex of every
+        # exactly-crossed (edge, face) pair. Plain racing writes of the same
+        # value -- order-independent. Runs on device right after
+        # detect_crossings so the frame needs no host sync for the flags.
+        k = wp.tid()
+        if k >= wp.min(count[0], maxCross):
+            return
+        e = pairs[k, 0]
+        f = pairs[k, 1]
+        flags[edge_ids[e, 0]] = 1
+        flags[edge_ids[e, 1]] = 1
+        flags[tri_ids[f, 0]] = 1
+        flags[tri_ids[f, 1]] = 1
+        flags[tri_ids[f, 2]] = 1
+
+    @staticmethod
+    @wp.kernel
+    def apply_uncross(
+            ids: wp.array(dtype=wp.int32),
+            disp: wp.array(dtype=wp.vec3),
+            pos: wp.array(dtype=wp.vec3)):
+        # Crossing-resolver APPLY: per-frame, host-voted uncross displacements
+        # (unique vertex ids, magnitudes capped per vertex at the depth-complete
+        # bound -- max(uncrossStep, own deepest need), <= uncrossStepMax).
+        # Velocity is NOT touched: the next substep's integrate freezes the
+        # corrected position into prev_pos, so the flip does not inject
+        # kinetic energy.
+        k = wp.tid()
+        pos[ids[k]] = pos[ids[k]] + disp[k]
+
+    @staticmethod
+    @wp.kernel
     def clamp_displacement(
             inv_mass: wp.array(dtype=float),
             prev_pos: wp.array(dtype=wp.vec3),  # frozen penetration-free reference X
             pos: wp.array(dtype=wp.vec3),
             truncation_ts: wp.array(dtype=float),
-            push: wp.array(dtype=wp.vec3)):
+            push: wp.array(dtype=wp.vec3),
+            push_limit: wp.array(dtype=float)):
         # Displacement governor: bound each free particle's trial displacement
         # |pos - prev_pos| to maxDisplacement, after the XPBD solve and before
         # self-collision. A contract-valid substep travels far below it, so it is a
@@ -1965,6 +3738,7 @@ class Cloth(Input):
         # truncation_ts/push.
         truncation_ts[i] = 1.0
         push[i] = wp.vec3()
+        push_limit[i] = 1.0e6  # unbounded until a narrowphase pair tightens it
         if inv_mass[i] == 0.0:
             return  # anchors are host-driven
         dx = pos[i] - prev_pos[i]
@@ -1981,17 +3755,65 @@ class Cloth(Input):
             prev_pos: wp.array(dtype=wp.vec3),
             pos: wp.array(dtype=wp.vec3),
             truncation_ts: wp.array(dtype=float),
-            push: wp.array(dtype=wp.vec3)):
+            push: wp.array(dtype=wp.vec3),
+            push_limit: wp.array(dtype=float),
+            center: wp.array(dtype=wp.vec3),   # CURRENT substep sphere center
+            radius: wp.array(dtype=float),
+            dc_arr: wp.array(dtype=wp.vec3),   # PER-SUBSTEP sphere translation
+            dr_arr: wp.array(dtype=float)):    # PER-SUBSTEP radius change
         i = wp.tid()
         if inv_mass[i] == 0.0:
             return  # leave host-driven anchors untouched
         # Bound the accumulated recovery push (see pushClamp): keeps a dense-overlap
-        # substep from flinging a particle and pumping unbounded energy.
+        # substep from flinging a particle and pumping unbounded energy. With
+        # FAR_GUARD, additionally bound it by the crossing budget (kappa * the
+        # tightest near pair's remaining frozen gap): a net push composed
+        # across many pairs in a squeeze can no longer carry this vertex
+        # across its tightest gap. The leftover budget is handed to
+        # fingertip_project's eviction cap (same-substep stream order).
         p = push[i]
         lp = wp.length(p)
-        if lp > pushClamp:
-            p = p * (pushClamp / lp)
-        pos[i] = prev_pos[i] + (pos[i] - prev_pos[i]) * truncation_ts[i] + p
+        cap = pushClamp
+        if FAR_GUARD != 0 and FAR_BUDGET_PUSH != 0:
+            # FLOORED budget on the recovery push: the raw cap doubled fuzz
+            # fails and stalled pressed piles (recovery starved), while a full
+            # exemption let the push-composition creator class (10/74) leak
+            # small B-bursts back. Never throttle recovery below half its
+            # normal strength; the eviction (45/74 of creators) still gets
+            # the fully decremented budget.
+            cap = wp.min(cap, wp.max(push_limit[i], 0.5 * pushClamp))
+        if lp > cap:
+            p = p * (cap / lp)
+            lp = cap
+        if FAR_GUARD != 0:
+            push_limit[i] = wp.max(push_limit[i] - lp, 0.0)
+        base = prev_pos[i] + (pos[i] - prev_pos[i]) * truncation_ts[i]
+        x = base + p
+        # Floor invariant (same rule as add_deltas): the C<0 recovery push may
+        # not expel a particle through the ground, nor deepen one already below.
+        fb = wp.min(base[1], thickness)
+        if x[1] < fb:
+            x = wp.vec3(x[0], fb, x[2])
+        # Shell invariant: the push may not drive a particle DEEPER into the
+        # sphere either. In a crush knot wrapped on the shell, the wad's c<0
+        # pushes shove an inside particle inward at up to pushClamp/substep --
+        # exactly matching the collider's bounded ejection, a permanent
+        # stalemate (measured as persistent post-release sphere penetration).
+        # Cancel only the radial-inward component, and only when the result
+        # ends up inside the shell and deeper than the pre-push base.
+        ce = center[0] + dc_arr[0]
+        re = radius[0] + dr_arr[0] + thickness
+        dvx = Cloth.radial(x - ce)
+        dx2 = wp.dot(dvx, dvx)
+        if dx2 < re * re:
+            dvb = Cloth.radial(base - ce)
+            db = wp.length(dvb)
+            if db > epsilon and dx2 < db * db:
+                nrad = dvb / db
+                inward = wp.dot(x - base, nrad)
+                if inward < 0.0:
+                    x -= inward * nrad
+        pos[i] = x
 
     @staticmethod
     @wp.kernel
@@ -2004,7 +3826,8 @@ class Cloth(Input):
             radius: wp.array(dtype=float),    # CURRENT substep sphere radius
             dc_arr: wp.array(dtype=wp.vec3),  # PER-SUBSTEP sphere translation (frame dc / numSubsteps)
             dr_arr: wp.array(dtype=float),    # PER-SUBSTEP radius change (frame dr / numSubsteps)
-            dq_arr: wp.array(dtype=wp.quat)):  # PER-SUBSTEP rotation (frame dq ^ (1/numSubsteps))
+            dq_arr: wp.array(dtype=wp.quat),  # PER-SUBSTEP rotation (frame dq ^ (1/numSubsteps))
+            vt_count: wp.array(dtype=wp.int32)):  # candidate-face counts (stack-pressure proxy)
         # Swept CCD against the moving / growing sphere: the analytic time-of-impact
         # catches approaching particles on the swept surface (no tunneling at any
         # drag speed); a static end-pose contact then resolves already-inside /
@@ -2032,7 +3855,7 @@ class Cloth(Input):
         # Pass 1: swept sphere -> snap approaching particles onto the swept surface.
         hit, c = Cloth.swept_sphere_ccd(prev_pos[i], vel_eff, sc, sr, dc, dr, dt)
         if hit:
-            n = wp.normalize(c - sc - dc)
+            n = wp.normalize(Cloth.radial(c - sc - dc))
             x = c + thickness * n
 
         # Pass 2: contact at this substep's end pose. The solved position's penetration
@@ -2040,7 +3863,7 @@ class Cloth(Input):
         # swept test does not fire because the per-substep travel is sub-margin).
         c_end = sc + dc
         r_end = sr + dr + thickness
-        dv = x - c_end
+        dv = Cloth.radial(x - c_end)
         d = wp.length(dv)
         if d > epsilon and d < r_end:
             n = dv / d
@@ -2051,18 +3874,53 @@ class Cloth(Input):
             vrel = vel_eff - v_surf
             vt = vrel - wp.dot(n, vrel) * n
             lvt = wp.length(vt)
-            x = c_end + r_end * n  # non-penetration: project onto the offset surface
+            # non-penetration: step toward the offset surface, velocity-bounded
+            # (projClamp) so a squeezed particle cannot be ejected through a
+            # fabric sheet resting above it in a single substep
+            x_t = c_end + r_end * n + Cloth.axial(x - c_end)
+            # Pile-crush pinch: a mostly-DOWNWARD radial ejection of a particle
+            # under real stacking pressure (vt_count) drives it through every
+            # pancaked layer between the shell bottom and the floor, one
+            # projClamp step per substep -- the descending shell "eats" the top
+            # of the stack and spits it through the rest (the crossing pump
+            # behind permanent post-crush entanglement). Exit horizontally at
+            # the particle's own height instead: the lateral shell boundary at
+            # that layer -- parallel to the squeezed sheets, so the ejection
+            # cannot cross them, and it doubles as the pinch extrusion pump.
+            # Depth gate: only the shallow, per-substep "eaten" band exits
+            # laterally; a deeply contained particle takes the radial route so
+            # sphere non-penetration always converges (a pure-lateral exit can
+            # be meters long and starves it -- measured as persistent
+            # post-release sphere penetration).
+            # (sphere-crush machinery: compiled out for the cylinder kind, whose
+            # scenarios never park the collider on a floor pile)
+            if COLLIDER_KIND == 0 and n[1] < -0.5 and -lambda_n < 2.0 * d_offset \
+                    and vt_count[i] >= extrudePressure:
+                dyv = c_end[1] - x[1]
+                rr = r_end * r_end - dyv * dyv
+                hx = x[0] - c_end[0]
+                hz = x[2] - c_end[2]
+                hd2 = hx * hx + hz * hz
+                if rr > 0.0 and hd2 > epsilon:
+                    rho = wp.sqrt(rr / hd2)
+                    x_t = wp.vec3(c_end[0] + rho * hx, x[1], c_end[2] + rho * hz)
+            step = x_t - x
+            sl = wp.length(step)
+            if sl > projClamp:
+                step *= projClamp / sl
+            x = x + step
             if lvt > epsilon:
                 lambda_f = wp.max(0.4 * lambda_n, -lvt * dt)
                 x += (vt / lvt) * lambda_f
 
-        # Ground plane at y = thickness, with friction.
+        # Ground plane at y = thickness, with friction (bounded snap: same
+        # through-fabric teleport hazard as the sphere ejection, at the pile).
         if x[1] < thickness:
             n = Ground.NORMAL
             lambda_n = x[1] - thickness  # < 0 below ground
             vt = vel_eff - wp.dot(n, vel_eff) * n
             lvt = wp.length(vt)
-            x = wp.vec3(x[0], thickness, x[2])
+            x = wp.vec3(x[0], wp.min(thickness, x[1] + projClamp), x[2])
             if lvt > epsilon:
                 lambda_f = wp.max(0.65 * lambda_n, -lvt * dt)
                 x += (vt / lvt) * lambda_f
@@ -2104,17 +3962,41 @@ class Cloth(Input):
         pa = pos[va]
         pb = pos[vb]
         ab = pb - pa
-        ab2 = wp.dot(ab, ab)
+        # Closest point of the segment in the collider's RADIAL metric (identity
+        # for the sphere; xy for the cylinder, where an axis-parallel edge keeps
+        # t = 0 and the vertex pass covers its endpoints).
+        abr = Cloth.radial(ab)
+        ab2 = wp.dot(abr, abr)
         t = 0.0
         if ab2 > epsilon:
-            t = wp.clamp(wp.dot(c_end - pa, ab) / ab2, 0.0, 1.0)
+            t = wp.clamp(wp.dot(Cloth.radial(c_end - pa), abr) / ab2, 0.0, 1.0)
         cp = pa + t * ab
-        dv = cp - c_end
+        dv = Cloth.radial(cp - c_end)
         d = wp.length(dv)
         if d <= epsilon or d >= r_end:
             return
         n = dv / d
         depth = r_end - d
+        # Pile-crush pinch (same redirect as collider_project pass 2): when the
+        # shell is parked near the floor, a downward radial ejection drives the
+        # edge through the pancaked stack below. Exit laterally at the contact
+        # point's own height instead.
+        # (sphere-crush machinery: compiled out for the cylinder kind)
+        if COLLIDER_KIND == 0 and n[1] < -0.5 and depth < 2.0 * d_offset \
+                and c_end[1] - r_end < thickness + extrudeBand:
+            dyv = c_end[1] - cp[1]
+            rr = r_end * r_end - dyv * dyv
+            hx = cp[0] - c_end[0]
+            hz = cp[2] - c_end[2]
+            hd2 = hx * hx + hz * hz
+            if rr > 0.0 and hd2 > epsilon:
+                rho = wp.sqrt(rr / hd2)
+                x_t = wp.vec3(c_end[0] + rho * hx, cp[1], c_end[2] + rho * hz)
+                dl = x_t - cp
+                dll = wp.length(dl)
+                if dll > epsilon:
+                    n = dl / dll
+                    depth = dll
 
         # Move the contact point out by `depth` along n with the minimum-norm endpoint
         # displacements (weights 1-t and t), skipping pinned endpoints. Accumulated via
@@ -2131,11 +4013,125 @@ class Cloth(Input):
         # w >= 0.5 with both endpoints free; it only approaches 0 when the contact sits
         # next to a pinned endpoint -- clamp so the free endpoint's push stays bounded
         # (the remaining gap resolves over subsequent substeps).
-        s = depth / wp.max(w, 0.1)
+        s = wp.min(depth, projClamp) / wp.max(w, 0.1)
         if wa != 0.0:
             wp.atomic_add(deltas, va, (1.0 - t) * s * n)
         if wb != 0.0:
             wp.atomic_add(deltas, vb, t * s * n)
+
+    @staticmethod
+    @wp.kernel
+    def advance_grab_anchors(anchor_pos: wp.array(dtype=wp.vec3),
+                             anchor_delta: wp.array(dtype=wp.vec3)):
+        # One substep slice of each grab's frame motion (runs BEFORE apply, seeded
+        # at the previous frame's committed anchor point, so substep k places the
+        # patch at prev + (k+1)*delta and the last substep lands on the target).
+        i = wp.tid()
+        anchor_pos[i] = anchor_pos[i] + anchor_delta[i]
+
+    @staticmethod
+    @wp.kernel
+    def apply_grab_anchors(count: wp.array(dtype=wp.int32),
+                           member_ids: wp.array(dtype=wp.int32),
+                           member_ax: wp.array(dtype=wp.int32),
+                           member_off: wp.array(dtype=wp.vec3),
+                           anchor_pos: wp.array(dtype=wp.vec3),
+                           pos: wp.array(dtype=wp.vec3)):
+        # Place every grabbed (pinned) particle at its grab's CURRENT substep
+        # anchor point + offset. Runs right after integrate: prev_pos froze the
+        # pre-move position, so this substep's patch motion is a proper swept
+        # displacement that the self-collision broadphase and truncation see --
+        # the patch plows fabric instead of teleporting through it.
+        t = wp.tid()
+        if t >= count[0]:
+            return
+        pos[member_ids[t]] = anchor_pos[member_ax[t]] + member_off[t]
+
+    @staticmethod
+    @wp.kernel
+    def fingertip_project(inv_mass: wp.array(dtype=float),
+                          n_grabs: wp.array(dtype=wp.int32),
+                          anchor_pos: wp.array(dtype=wp.vec3),
+                          anchor_delta: wp.array(dtype=wp.vec3),
+                          prev_pos: wp.array(dtype=wp.vec3),
+                          pos: wp.array(dtype=wp.vec3),
+                          push_limit: wp.array(dtype=float)):
+        # Project free fabric out of each active grab's fingertip ball (see
+        # FINGER_COLLIDER). Velocity-bounded (projClamp) like the sphere's
+        # pass 2: a fast grip indents fabric transiently instead of
+        # teleporting it through neighboring sheets.
+        if FINGER_COLLIDER == 0:
+            return
+        i = wp.tid()
+        if inv_mass[i] == 0.0:
+            return
+        rr = fingerColliderR * fingerRadius
+        rc = fingerCcdR * fingerRadius
+        x = pos[i]
+        for g in range(n_grabs[0]):
+            b1 = anchor_pos[g]
+            if FINGER_CCD != 0:
+                # time-of-impact of the particle's substep segment vs the
+                # moving ball (both start-of-substep poses reconstructed);
+                # place a hit on the END-pose shell at the contact normal.
+                # Radius rc (>= the volumetric rr): entering trajectories only
+                # -- taut sheets that cannot comply with the bounded eviction
+                # are caught at CCD scale without a steady-state guard volume.
+                b0 = b1 - anchor_delta[g]
+                p0 = prev_pos[i]
+                sv = p0 - b0
+                c = wp.dot(sv, sv) - rc * rc
+                if c > 0.0:
+                    v = (x - p0) - anchor_delta[g]
+                    a = wp.dot(v, v)
+                    b = wp.dot(v, sv)
+                    if a > 1.0e-12 and b < 0.0:
+                        disc = b * b - a * c
+                        if disc > 0.0:
+                            t = (-b - wp.sqrt(disc)) / a
+                            if 0.0 <= t and t <= 1.0:
+                                bc = b0 + t * anchor_delta[g]
+                                n = wp.normalize((p0 + t * (x - p0)) - bc)
+                                x = b1 + n * rc
+            r = x - b1
+            d = wp.length(r)
+            if d < 1.0e-9 or d >= rr:
+                continue
+            step = wp.min(rr - d, fingerColliderPush * projClamp)
+            if FAR_GUARD != 0:
+                # Crossing budget (see FAR_GUARD): the eviction step may not
+                # exceed the leftover budget of this vertex's tightest near
+                # pair -- an eviction can no longer punch through a sheet
+                # closer than the step. Vertices with no near pair keep the
+                # full eviction speed (budget resets to 1e6 each substep), so
+                # onset grip clearance is unchanged. The CCD placement above
+                # stays uncapped (taut-sheet anti-tunnel).
+                step = wp.min(step, push_limit[i])
+            x = x + (r / d) * step
+        pos[i] = x
+
+    @staticmethod
+    @wp.kernel
+    def accumulate_grab_pressure(count: wp.array(dtype=wp.int32),
+                                 member_ids: wp.array(dtype=wp.int32),
+                                 member_ax: wp.array(dtype=wp.int32),
+                                 push: wp.array(dtype=wp.vec3),
+                                 pressure: wp.array(dtype=wp.vec3),
+                                 pressure_mag: wp.array(dtype=float)):
+        # Load-yielding grip: sum the pressure shares the narrowphase recorded on
+        # this substep's grabbed members (their push[] slots are otherwise unused
+        # -- apply_truncation skips inv_mass==0) into per-grab accumulators. Runs
+        # inside the captured graph right after the narrowphase, before next
+        # substep's clamp_displacement re-zeroes push.
+        t = wp.tid()
+        if t >= count[0]:
+            return
+        p = push[member_ids[t]]
+        m = wp.length(p)
+        if m > 0.0:
+            g = member_ax[t]
+            wp.atomic_add(pressure, g, p)
+            wp.atomic_add(pressure_mag, g, m)
 
     @staticmethod
     @wp.kernel
@@ -2338,7 +4334,17 @@ class Cloth(Input):
         # separate deltas.zero_() launch per iteration (19 launches/substep saved
         # across the solve, strain-limit and collider-edge blocks).
         tid = wp.tid()
-        pos[tid] += deltas[tid]
+        x = pos[tid] + deltas[tid]
+        # Floor invariant: internal corrections may not push a particle through
+        # the ground (from above y=thickness to below), nor deepen one already
+        # below (a falling-cloth dip from integrate). Under a sphere-onto-pile
+        # crush the summed downward corrections otherwise out-shove the single
+        # bounded ground snap and expel the bottom layers below the floor,
+        # crossing every layer on the way (permanent entanglement).
+        fb = wp.min(pos[tid][1], thickness)
+        if x[1] < fb:
+            x = wp.vec3(x[0], fb, x[2])
+        pos[tid] = x
         deltas[tid] = wp.vec3()
 
     @staticmethod
@@ -2458,56 +4464,268 @@ class Cloth(Input):
         tri_id = int(self._pickFace.numpy()[0])
         min_tri_dist = float(self._pickDist.numpy()[0])
         hit = tri_id >= 0
-        if not hit and not min_anchor_dist:
+
+        # Ids already claimed by another anchor (primary or patch member) are off
+        # limits: their hostInvMass currently reads 0.0, so grabbing one would
+        # record mass=0.0 and release would restore it as a permanent invisible pin.
+        claimed = {a.id for a in self.anchors}
+        for a in self.anchors:
+            claimed.update(mid for mid, _, _ in a.group)
+
+        # Resolve the pressed particle + its ray depth. A triangle hit grabs the
+        # first unclaimed vertex of the hit face. Otherwise (or if the whole face
+        # is claimed) fall back to the FINGERTIP-TOLERANT pick: the pixel ray is
+        # infinitesimal, so a press on the visible EDGE of fabric -- the corner
+        # of a floor pile, exactly what a user grabs to flatten it -- can graze
+        # past every triangle by ~2 mm and returned no anchor ("the drag is
+        # inoperant"). A finger pad has area: take the frontmost unclaimed
+        # particle whose distance to the ray is within fingerRadius (smallest
+        # ray depth, with the ray distance as a mild tiebreak toward what sits
+        # under the press point). Occluded deeper layers lie further ALONG the
+        # ray, so the frontmost candidate is the visible fabric.
+        particle_id = -1
+        grab_depth = 0.0
+        if hit:
+            for k in range(3):
+                cand = self.hostTriIds[tri_id, k].item()
+                if cand not in claimed:
+                    particle_id = cand
+                    grab_depth = min_tri_dist
+                    break
+        if particle_id < 0 and grabPickTolerant:
+            o = np.array([origin[0], origin[1], origin[2]])
+            dn = np.array([direction[0], direction[1], direction[2]])
+            rel = host_pos - o
+            t = rel @ dn
+            perp2 = np.einsum('ij,ij->i', rel, rel) - t * t
+            cand = (t > 0.05) & (perp2 < fingerRadius * fingerRadius)
+            if claimed:
+                cand[np.fromiter(claimed, dtype=np.int64)] = False
+            idx = np.nonzero(cand)[0]
+            if len(idx):
+                score = t[idx] + 2.0 * np.sqrt(np.maximum(perp2[idx], 0.0))
+                j = int(idx[np.argmin(score)])
+                particle_id = j
+                grab_depth = float(t[j])
+        if particle_id < 0 and not min_anchor_dist:
             return None
 
-        # Check if with the sphere is hit by the ray before any hit anchor or triangle
-        dist = ray_to_sphere(origin, direction, sphere.center, sphere.radius)
-        if dist and (not near_anchor or dist[0] < min_anchor_dist) and (not hit or dist[0] < min_tri_dist):
+        # Check if the collider is hit by the ray before any hit anchor or fabric
+        dist = ray_to_collider(origin, direction, sphere.center, sphere.radius)
+        if dist and (not near_anchor or dist[0] < min_anchor_dist) \
+                and (particle_id < 0 or dist[0] < grab_depth):
             return None
 
-        # Check if the hit locked anchor is closer than the hit triangle
-        if near_anchor and (not hit or min_anchor_dist <= min_tri_dist):
+        # Check if the hit locked anchor is closer than the hit fabric
+        if near_anchor and (particle_id < 0 or min_anchor_dist <= grab_depth):
             near_anchor.flags |= AnchorFlag.ACTIVE
             near_anchor.depth = min_anchor_dist
             near_anchor.screen = wp.vec2(screen_x, screen_y)
             return near_anchor.drag()
-
-        # Otherwise return a new anchor for the triangle. Ids already claimed by
-        # another anchor (primary or patch member) are off limits: their
-        # hostInvMass currently reads 0.0, so grabbing one would record mass=0.0
-        # and release would restore it as a permanent invisible pin.
-        claimed = {a.id for a in self.anchors}
-        for a in self.anchors:
-            claimed.update(mid for mid, _, _ in a.group)
-        particle_id = self.hostTriIds[tri_id, 0].item()
-        if particle_id in claimed:
+        if particle_id < 0:
             return None
+
         inv_mass = self.hostInvMass.numpy()
         anchor = Particle(id=particle_id,
                           screen=wp.vec2(screen_x, screen_y),
                           mass=inv_mass[particle_id].item(),
-                          depth=min_tri_dist)
+                          depth=grab_depth)
 
         # Fingertip grab: pin every particle within fingerRadius of the picked one
         # and drag them as a conforming patch (world offsets from the primary at
         # grab time; see update_anchors), skipping claimed ids.
-        center = host_pos[particle_id]
-        d2 = np.einsum('ij,ij->i', host_pos - center, host_pos - center)
-        for mid in np.nonzero(d2 < fingerRadius * fingerRadius)[0]:
-            mid = int(mid)
-            if mid == particle_id or mid in claimed:
-                continue
-            off = host_pos[mid] - center
-            anchor.group.append((mid, inv_mass[mid].item(),
-                                 wp.vec3f(off[0], off[1], off[2])))
+        anchor.group = self._fingertip_patch(particle_id, host_pos, inv_mass, claimed)
+
+        # Onset brake pre-arm (see GRAB_BRAKE / grabBrakeOnset): the committed
+        # first target can sit a patch-width away from the raw pick (depth /
+        # shell / stack rules), so a newborn grab otherwise sweeps at the full
+        # 0.45*d_offset/substep clamp through whatever is interleaved in the
+        # grip -- at 400^2 pile density that closure sweep IS the onset
+        # crossing burst (80-110 pairs in the first 2 frames, before the
+        # crossing brake has any signal). Start the brake hold non-zero: the
+        # first frames ramp in gently, and the hold decays to free authority
+        # within ~10 frames unless the sweep reports real crossings.
+        anchor.brake_hold = grabBrakeOnset
 
         self.anchors.append(anchor)
         return anchor.drag()
 
+    def _fingertip_patch(self, particle_id, host_pos, inv_mass, claimed):
+        """Membership of a fingertip grab centered on particle_id: every particle
+        within fingerRadius, restricted to the SAME SHEET. A Euclidean ball also
+        captures occluded layers folded behind the visible one (grabbing through
+        the fabric); the grid ring distance <= fingerRadius/spacing filter is
+        topological (same layer) by construction. Returns the group list of
+        (member id, original inv-mass, world offset from the primary)."""
+        center = host_pos[particle_id]
+        d2 = np.einsum('ij,ij->i', host_pos - center, host_pos - center)
+        near = d2 < fingerRadius * fingerRadius
+        ring = int(np.ceil(fingerRadius / self.spacing))
+        rows = np.arange(self.numParticles) // self.numCols
+        cols = np.arange(self.numParticles) % self.numCols
+        pr, pc = particle_id // self.numCols, particle_id % self.numCols
+        near &= (np.abs(rows - pr) <= ring) & (np.abs(cols - pc) <= ring)
+        group = []
+        for mid in np.nonzero(near)[0]:
+            mid = int(mid)
+            if mid == particle_id or mid in claimed:
+                continue
+            off = host_pos[mid] - center
+            group.append((mid, inv_mass[mid].item(),
+                          wp.vec3f(off[0], off[1], off[2])))
+        return group
+
+    def _build_rim_pairs(self, member_lists, inv_mass):
+        """Rim pair lists for the rim_truncate_* kernels (see RIM_SOLVER):
+        for each active grab's member set M on the grid, with S1 = free ring-1
+        skirt and zone = ring<=2 dilation of M,
+          VT: (v, face) with v in M|S1, face inside the zone touching M|S1,
+              v not in face, grid ring(v, face) == 1, >= 1 free vertex;
+          EE: unordered edge pairs, both edges inside the zone touching M|S1,
+              disjoint, ring(e1, e2) == 1, >= 1 free endpoint.
+        Rest ring-1 gaps are >= spacing*sqrt(2)/2 (3.3x rimDOffset), so these
+        pairs are inert until a cell kinks to sub-half-fabric-thickness.
+        Vectorized numpy; runs only when grab membership changes."""
+        nr = self.numParticles // self.numCols
+        nc = self.numCols
+        T = self.hostTriIds
+        E = self.hostEdgeIds
+        vt_chunks, ee_chunks = [], []
+        for mem in member_lists:
+            mask = np.zeros((nr, nc), dtype=bool)
+            mask[mem // nc, mem % nc] = True
+
+            def dilate(m):
+                # 3x3 (Chebyshev ring-1) dilation; every |= reads from a copy,
+                # never an overlapping view (in-place shifted ORs can cascade)
+                row = m.copy()
+                row[:-1] |= m[1:]; row[1:] |= m[:-1]
+                out = row.copy()
+                out[:, :-1] |= row[:, 1:]; out[:, 1:] |= row[:, :-1]
+                return out
+
+            d1 = dilate(mask)   # 3x3 dilate: ring <= 1
+            d2 = dilate(d1)     # 5x5 dilate: ring <= 2
+            core = d1.reshape(-1)                  # M | S1 (ring <= 1)
+            zone = d2.reshape(-1)                  # ring <= 2
+            core_ids = np.nonzero(core)[0].astype(np.int64)
+            rcv = np.stack([core_ids // nc, core_ids % nc], axis=1)
+            free = inv_mass > 0.0
+            # --- VT: core vertices x zone faces at ring exactly 1 ---
+            fsel = np.nonzero(zone[T].all(axis=1) & core[T].any(axis=1))[0]
+            if len(fsel) and len(core_ids):
+                FT = T[fsel].astype(np.int64)               # [F, 3]
+                rcf = np.stack([FT // nc, FT % nc], axis=2)  # [F, 3, 2]
+                ring = np.abs(rcv[:, None, None, :] - rcf[None, :, :, :]) \
+                    .max(axis=3).min(axis=2)                 # [K, F]
+                contains = (FT[None, :, :] == core_ids[:, None, None]).any(axis=2)
+                anyfree = free[core_ids][:, None] | free[FT].any(axis=1)[None, :]
+                ki, fi = np.nonzero((ring == 1) & ~contains & anyfree)
+                if len(ki):
+                    vt_chunks.append(np.column_stack(
+                        [core_ids[ki], FT[fi]]).astype(np.int32))
+            # --- EE: zone edge pairs at ring exactly 1 ---
+            esel = np.nonzero(zone[E].all(axis=1) & core[E].any(axis=1))[0]
+            if len(esel) > 1:
+                EZ = E[esel].astype(np.int64)                # [n, 2]
+                rce = np.stack([EZ // nc, EZ % nc], axis=2)  # [n, 2, 2]
+                ring = np.abs(rce[:, None, :, None, :] - rce[None, :, None, :, :]) \
+                    .max(axis=4).reshape(len(EZ), len(EZ), 4).min(axis=2)
+                shared = (EZ[:, None, :, None] == EZ[None, :, None, :]).any(axis=(2, 3))
+                anyfree = free[EZ].any(axis=1)
+                pair_ok = (ring == 1) & ~shared \
+                    & (anyfree[:, None] | anyfree[None, :])
+                ii, jj = np.nonzero(np.triu(pair_ok, k=1))   # each unordered pair once
+                if len(ii):
+                    ee_chunks.append(np.column_stack(
+                        [EZ[ii], EZ[jj]]).astype(np.int32))
+        vt = np.concatenate(vt_chunks, axis=0) if vt_chunks \
+            else np.zeros((0, 4), np.int32)
+        ee = np.concatenate(ee_chunks, axis=0) if ee_chunks \
+            else np.zeros((0, 4), np.int32)
+        # overlapping grabs could stage the same pair twice (double-counted
+        # atomic pushes) -- dedup rows
+        if len(member_lists) > 1:
+            if len(vt):
+                vt = np.unique(vt, axis=0)
+            if len(ee):
+                ee = np.unique(ee, axis=0)
+        return vt, ee
+
+    def _slide_grab(self, particle, pointer_np, pos, inv_mass, origin, direction):
+        """Sliding grab: the committed anchor target has chronically lagged the
+        commanded pointer-ray target (yield stall against a snagged patch, or
+        any obstruction), so slip the grip over the fabric like a finger pad:
+        release the current members (inv-mass restored through the normal
+        bookkeeping, exactly once), re-grab a fingertip patch around the vertex
+        nearest to a point stepped from the current anchor toward the pointer,
+        refresh the anchor's id/group/depth, and continue the same stroke.
+        prev_target seeds at the NEW grab's own current position -- never the
+        old anchor's -- so the per-substep sweep sees no teleport."""
+        # 1) release the old patch: restore primary + member inv-mass
+        inv_mass[particle.id] = particle.mass
+        for mid, mmass, _ in particle.group:
+            inv_mass[mid] = mmass
+        # 2) step one fingertip from the committed anchor toward the pointer
+        dvec = pointer_np - particle.prev_target
+        dlen = float(np.linalg.norm(dvec))
+        probe = particle.prev_target + (dvec * (min(grabSlideStep, dlen) / dlen)
+                                        if dlen > 1e-9 else 0.0)
+        # 3) re-pick: nearest particle to the probe, other anchors' claims excluded
+        #    (our own just-released members are fair game -- the grip may slide
+        #    only partway off its old patch)
+        claimed = set()
+        for a in self.anchors:
+            if a is particle:
+                continue
+            claimed.add(a.id)
+            claimed.update(mid for mid, _, _ in a.group)
+        d2 = np.einsum('ij,ij->i', pos - probe, pos - probe)
+        if claimed:
+            d2[np.fromiter(claimed, dtype=np.int64)] = np.inf
+        new_id = int(np.argmin(d2))
+        # 4) refresh identity + fingertip patch around the new primary
+        particle.id = new_id
+        particle.mass = inv_mass[new_id].item()
+        particle.group = self._fingertip_patch(new_id, pos, inv_mass, claimed)
+        inv_mass[new_id] = 0.0
+        # 5) stroke continuity: pointer-ray depth of the new grab point, and the
+        #    sweep origin at the new grab's OWN position (no teleport)
+        center = np.asarray(pos[new_id], dtype=np.float64)
+        o = np.array([origin[0], origin[1], origin[2]], dtype=np.float64)
+        dn = np.array([direction[0], direction[1], direction[2]], dtype=np.float64)
+        particle.depth = max(0.05, float((center - o) @ dn))
+        particle.prev_target = center.copy()
+        if os.environ.get("GRAB_DEBUG"):
+            print(f"[slide] regrab -> id={new_id} members={len(particle.group)} "
+                  f"depth={particle.depth:.3f}", flush=True)
+
+    def _record_frame(self):
+        rec = {"f": getattr(self, "_rec_frame", 0), "anchors": [], "pins": []}
+        self._rec_frame = rec["f"] + 1
+        for a in self.anchors:
+            if a.flags & AnchorFlag.ACTIVE:
+                o, d = ray_from_screen(a.screen[0], a.screen[1])
+                rec["anchors"].append(dict(
+                    id=int(a.id), screen=[float(a.screen[0]), float(a.screen[1])],
+                    origin=[float(o[0]), float(o[1]), float(o[2])],
+                    dir=[float(d[0]), float(d[1]), float(d[2])],
+                    depth=float(a.depth)))
+            elif a.flags & AnchorFlag.LOCKED:
+                rec["pins"].append(int(a.id))
+        rec["sphere"] = [float(sphere.center[0]), float(sphere.center[1]),
+                         float(sphere.center[2]), float(sphere.radius),
+                         float(sphere.dc[0]), float(sphere.dc[1]),
+                         float(sphere.dc[2]), float(sphere.dr)]
+        _clothRecordFile.write(json.dumps(rec) + "\n")
+        _clothRecordFile.flush()
+
     def update_anchors(self):
         inv_mass = self.hostInvMass.numpy()
         pos = self.hostPos.numpy()
+        self.activeGrabs = []
+        if _clothRecordFile is not None:
+            self._record_frame()
 
         for particle in self.anchors:
             if not particle.flags & (AnchorFlag.ACTIVE | AnchorFlag.LOCKED):
@@ -2523,6 +4741,8 @@ class Cloth(Input):
                 # the ACTIVE branch below
                 for mid in [particle.id] + [m for m, _, _ in particle.group]:
                     r = wp.vec3f(pos[mid]) - (sphere.center + sphere.dc)
+                    if colliderKind == 1:
+                        r = wp.vec3f(r[0], r[1], 0.0)  # rod: radial = xy only
                     d = wp.length(r) - (sphere.radius + sphere.dr) - thickness - particleRadius
                     if d < 0:
                         pos[mid] -= d * wp.normalize(r)
@@ -2532,14 +4752,20 @@ class Cloth(Input):
             screen_x, screen_y = particle.screen
             origin, direction = ray_from_screen(screen_x, screen_y)
 
-            # Check intersection with the sphere
-            dist = ray_to_sphere(origin, direction, sphere.center, sphere.radius + thickness)
-            if dist:
-                mid = (dist[0] + dist[1]) / 2.0
-                if mid < particle.depth < dist[1]:
-                    particle.depth = dist[1]
-                elif dist[0] < particle.depth < mid:
-                    particle.depth = dist[0]
+            # Keep the anchor on the CAMERA side of the sphere. The old rule
+            # snapped to whichever boundary was nearer to the current depth
+            # (mid < depth < far -> far), but fabric hanging BESIDE the sphere
+            # sits at the sphere-center's depth, so dragging it across the
+            # silhouette flung the anchor to the FAR shell -- the patch orbited
+            # behind the sphere while its sheet wrapped the front face (reads as
+            # interpenetration), and the depth then stuck at the far value after
+            # leaving the silhouette (cloth left hanging in the air). Clamping to
+            # the near boundary drags fabric OVER the visible face, which is what
+            # the gesture means; a grab genuinely behind the sphere (depth beyond
+            # the far boundary) is left alone.
+            dist = ray_to_collider(origin, direction, sphere.center, sphere.radius + thickness)
+            if dist and dist[0] < particle.depth < dist[1]:
+                particle.depth = dist[0]
 
             # Check intersection with the ground
             d = wp.dot(Ground.NORMAL, direction)
@@ -2547,50 +4773,980 @@ class Cloth(Input):
                 depth = -wp.dot(Ground.NORMAL, origin) / d
                 if camera.pos[1] >= 0.0 and 0.5 < depth < particle.depth:
                     particle.depth = depth
+                elif (grabGroundFollow and camera.pos[1] >= 0.0
+                      and depth > particle.depth > 0.5
+                      and pos[particle.id][1] <= grabGroundBand):
+                    # Fabric held ON the floor, pointer receding: the old rule
+                    # only ever DECREASED depth above ground, so dragging floor
+                    # fabric AWAY from the camera left the target hovering at
+                    # the grab depth, short of the pointer -- far-side floor
+                    # drags moved ~1/3 of the commanded travel ("the drag is
+                    # inoperant"). Let the target FOLLOW the receding ground
+                    # intersection while the grabbed fabric is at floor level.
+                    # RATE-LIMITED (2x the anchor's own speed clamp): near the
+                    # horizon the ground depth diverges, and an uncapped follow
+                    # would park the depth at a huge value that outlives the
+                    # gesture (the sticky-depth bug class) and spoof the
+                    # sliding-grab's chronic-lag trigger.
+                    particle.depth = min(depth, particle.depth
+                                         + 0.9 * d_offset * numSubsteps)
                 elif (camera.pos[1] < 0.0
                       and wp.abs(pos[particle.id][1]) <= 2.0 * thickness
                       and depth > particle.depth):
                     particle.depth = depth
 
-            pos[particle.id] = origin + direction * particle.depth
-            # Move the grabbed patch with the primary. Pinned particles bypass the
-            # collider, so members are pushed out of the sphere here (the primary
-            # already avoids it via the ray-depth adjustment above). The grip is
-            # CONFORMING, not rigid: each frame the stored offset relaxes toward
-            # where the member actually ended up (i.e. the fabric may slip within
-            # the grip). A rigid grab-time patch dragged across the sphere scrubs
-            # a fixed plate over a curved surface with fabric sandwiched between
-            # two hard constraints -- measured: it buckles the pinched fabric at
-            # cell scale (flipped triangles, the "inverted" look) and the churn is
-            # slow. Relaxation rate 0.15/frame keeps the grip firm at drag
-            # timescales while letting the patch conform within ~half a second.
-            new_group = []
-            for mid, mmass, off in particle.group:
-                inv_mass[mid] = 0.0
-                p0 = pos[particle.id] + off
-                r = wp.vec3f(p0) - (sphere.center + sphere.dc)
-                d = wp.length(r) - (sphere.radius + sphere.dr + thickness + particleRadius)
-                if d < 0.0:
-                    p = p0 - d * wp.normalize(r)
-                    # conform: fold half of the push-out into the stored offset, so
-                    # the grip lets the fabric slip AROUND the sphere instead of
-                    # scrubbing the grab-time shape against it (only the push-out
-                    # conforms -- anchor motion never leaks in, so the grip stays
-                    # firm during sustained drags away from the sphere)
-                    off = off + 0.5 * (wp.vec3f(p) - wp.vec3f(p0))
+            target = origin + direction * particle.depth
+            # Stage the grab for the PER-SUBSTEP sweep instead of teleporting the
+            # patch here: a once-per-frame host-side position write moves the
+            # pinned fabric in one invisible jump (several times d_offset on a
+            # normal drag), so collision never sees the motion and the reference
+            # state can land already interpenetrated inside other cloth --
+            # measured as persistent self-collision violations and rising frame
+            # times when dragging one flank across into the other. simulate()
+            # packs activeGrabs into device buffers; advance/apply_grab_anchors
+            # move the patch one slice per substep inside the captured graph,
+            # exactly like the sphere collider's pose.
+            # The grip stays CONFORMING: each frame the sphere push-out of each
+            # member's TARGET position is half-folded into its stored offset, so
+            # fabric slips around the sphere instead of scrubbing the grab-time
+            # shape against it (only the push-out conforms -- anchor motion never
+            # leaks in, so the grip stays firm away from the sphere).
+            if particle.prev_target is None:
+                particle.prev_target = np.array(pos[particle.id], dtype=np.float64)
+            # SLIDING GRAB: when the committed anchor chronically lags the
+            # commanded pointer-ray target, the grip is snagged (yield stall
+            # against an anchored fold, or any obstruction) -- a real finger
+            # would SLIP over the fabric rather than stay glued to a stuck
+            # patch. Trigger only on CHRONIC lag: several consecutive frames
+            # beyond the threshold AND not shrinking (a post-flick anchor
+            # catches up at ~max_step per frame, so its lag falls fast and
+            # resets the counter; a snagged grip's lag holds or grows).
+            raw_np = np.array([target[0], target[1], target[2]], dtype=np.float64)
+            if grabSlide and not particle.flags & AnchorFlag.LOCKED:
+                # (LOCKED anchors keep their identity: sliding would silently
+                # move a user-placed pin to a different vertex.)
+                lag = float(np.linalg.norm(raw_np - particle.prev_target))
+                max_step_f = 0.45 * d_offset * numSubsteps
+                if lag > grabSlideLag and lag > particle.last_lag - 0.5 * max_step_f:
+                    particle.slide_frames += 1
                 else:
-                    p = p0
-                pos[mid] = p
+                    particle.slide_frames = 0
+                particle.last_lag = lag
+                if particle.slide_frames >= grabSlideFrames:
+                    self._slide_grab(particle, raw_np, pos, inv_mass,
+                                     origin, direction)
+                    particle.slide_frames = 0
+                    particle.last_lag = 0.0
+                    # same stroke, new grip: re-derive the pointer target at
+                    # the refreshed depth
+                    target = origin + direction * particle.depth
+            # Clamp the grab's effective speed: the free fabric a pinned patch
+            # plows can yield at most ~pushClamp (0.5*d_offset) per substep, so a
+            # patch advancing faster than that MUST cross through it -- pinned
+            # motion has no final-say projection like the sphere collider. Cap the
+            # per-substep advance at 0.45*d_offset (~4 m/s at 30 substeps): violent
+            # flicks rubber-band (the anchor lags the pointer and catches up when
+            # it slows), which is also what dragging real cloth through real cloth
+            # feels like. prev_target commits the CLAMPED point so the device
+            # sweep and the host state never disagree.
+            delta = np.array([target[0], target[1], target[2]]) - particle.prev_target
+            dist = float(np.linalg.norm(delta))
+            max_step = 0.45 * d_offset * numSubsteps
+            if dist > max_step:
+                clamped = particle.prev_target + delta * (max_step / dist)
+                target = wp.vec3f(clamped[0], clamped[1], clamped[2])
+            # Load-yielding grip: yield under the plow pressure LAST frame's
+            # narrowphase recorded on this grab's members (one frame of latency;
+            # see the grabYield* notes near pushClamp). STALL shrinks the advance
+            # toward the pointer as the mean member load rises; RETREAT backs the
+            # anchor off along the net separation direction, capped at max_step
+            # per frame so the grip lags (rubber-bands) but never detaches from
+            # the patch -- members always sit exactly at anchor + offset.
+            yld = self.grabPressureHost.get(particle.id)
+            if yld is not None and (grabYieldStallK > 0.0 or grabYieldGain > 0.0):
+                pvec, pmag, n_mem = yld
+                mean_mag = pmag / float(n_mem * numSubsteps)  # per member-substep
+                t_np = np.array([target[0], target[1], target[2]], dtype=np.float64)
+                pv = np.asarray(pvec, dtype=np.float64)
+                pnorm = float(np.linalg.norm(pv))
+                # DIRECTION-AWARE yield (see grabYieldDirectional): pressure
+                # magnitude alone stalls EXTRACTION exactly like plowing --
+                # pulling members OUT along the net direction the contacts
+                # push them (pvec, the escape direction) relieves the load,
+                # yet the isotropic stall brakes it all the same. Split the
+                # advance: ONLY the RELIEVING component (along +pvec) passes
+                # unstalled; the remainder -- tangential AND anti-parallel --
+                # keeps the validated isotropic stall + retreat. (A first cut
+                # also passed the tangential component "because plowing
+                # rotates pvec"; that is true in a pile but NOT on the sphere
+                # shell, where pvec stays radial while a folded stack is
+                # plowed tangentially across it -- fold_slide bad_streak went
+                # 3 -> 30. Relief-pass-only restores the old behavior there.)
+                # Requires a coherent net direction; a symmetric squeeze
+                # (|pvec| << sum of member push magnitudes) has no meaningful
+                # escape direction and stays fully isotropic.
+                directional = (grabYieldDirectional and pnorm > 1e-12
+                               and pnorm > grabYieldDirCoherence * pmag)
+                adv = t_np - particle.prev_target
+                relief = np.zeros(3)
+                if directional:
+                    ph = pv / pnorm
+                    a_par = float(adv @ ph)
+                    if a_par > 0.0:
+                        relief = a_par * ph  # passes the stall untouched
+                        adv = adv - relief
+                # Pressure-budget: track the SUSTAINED pressure with an EMA and
+                # stall only on the excess over beta*ema (see grabYieldSustain*).
+                # The EMA updates every yielded frame, including mean_mag==0, so
+                # the budget decays when contact clears.
+                m_eff = mean_mag
+                if grabYieldSustainBeta > 0.0:
+                    p_ema = getattr(particle, "pressure_ema", 0.0)
+                    m_eff = max(0.0, mean_mag - grabYieldSustainBeta * p_ema)
+                    particle.pressure_ema = (
+                        (1.0 - grabYieldSustainEma) * p_ema
+                        + grabYieldSustainEma * mean_mag)
+                scale = 1.0
+                if grabYieldStallK > 0.0 and m_eff > 0.0:
+                    scale = 1.0 / (1.0 + grabYieldStallK * m_eff / d_offset)
+                minScale = grabYieldMinScale
+                if minScale > 0.0:
+                    # Minimum drag authority (see grabYieldMinScale).
+                    if grabYieldSat:
+                        # saturating shape: floor + (1-floor)/(1+K*m) -- keeps
+                        # a smooth curve but weakens mid-range braking (A/B'd
+                        # against the clip; see the ship notes).
+                        scale = minScale + (1.0 - minScale) * scale
+                    else:
+                        scale = max(scale, minScale)
+                if os.environ.get("GRAB_DEBUG"):
+                    print(f"[yield] dir={directional} coh={pnorm / max(pmag, 1e-12):.2f} "
+                          f"mean_mag={mean_mag:.5f} scale={scale:.3f} "
+                          f"relief={np.linalg.norm(relief):.4f} "
+                          f"|adv|={np.linalg.norm(adv):.4f}", flush=True)
+                adv = adv * scale
+                if grabYieldGain > 0.0:
+                    retreat = grabYieldGain * pv / float(n_mem)
+                    rmag = float(np.linalg.norm(retreat))
+                    if rmag > max_step:
+                        retreat *= max_step / rmag
+                    # Low-pass the retreat: the raw pressure signal is a
+                    # sawtooth (a retreat relieves the contact, so next
+                    # frame's pressure collapses, the advance lunges back in,
+                    # pressure spikes again...) -- applied raw it limit-cycles
+                    # the anchor at a few Hz, felt as shakiness when dragging
+                    # one flank against another (measured tv_ratio 1.5-1.7 vs
+                    # 0.2 stall-only). An EMA turns the sawtooth into a steady
+                    # partial back-off; the stall term is smooth already and
+                    # stays unfiltered.
+                    ema = getattr(particle, "retreat_ema", None)
+                    if ema is None:
+                        ema = np.zeros(3)
+                    retreat = (1.0 - grabYieldRetreatEma) * ema \
+                        + grabYieldRetreatEma * retreat
+                    particle.retreat_ema = retreat
+                    adv = adv + retreat
+                t_np = particle.prev_target + relief + adv
+                target = wp.vec3f(t_np[0], t_np[1], t_np[2])
+            # CROSSING BRAKE (see GRAB_BRAKE): while the exact sweep reports
+            # actual edge-through-face crossings within grabBrakeR of this
+            # anchor, throttle the whole advance (relief included -- a rip is
+            # not a legitimate contact, so the pressure stall's directional
+            # bypass and authority floor do not apply) by 1/(1 + K*n), with
+            # its own much lower floor. Self-releasing: the count comes back
+            # from each frame's sweep, so as the recovery machinery clears
+            # the plow front the brake fades and full authority returns.
+            if grabBrakeK > 0.0 and particle.prev_target is not None:
+                n_near = getattr(self, "crossNearHost", {}).get(particle.id, 0)
+                # Peak-hold with decay (see grabBrakeDecay): brake on the max
+                # of the current count and the decaying recent peak.
+                hold = max(float(n_near),
+                           getattr(particle, "brake_hold", 0.0) * grabBrakeDecay)
+                particle.brake_hold = hold
+                if hold > 0.5:
+                    t_np = np.array([target[0], target[1], target[2]],
+                                    dtype=np.float64)
+                    adv_b = t_np - particle.prev_target
+                    bscale = max(1.0 / (1.0 + grabBrakeK * hold),
+                                 grabBrakeFloor)
+                    t_np = particle.prev_target + adv_b * bscale
+                    target = wp.vec3f(t_np[0], t_np[1], t_np[2])
+                    if os.environ.get("GRAB_DEBUG"):
+                        print(f"[brake] id={particle.id} n_near={n_near} "
+                              f"hold={hold:.1f} scale={bscale:.3f}", flush=True)
+            # The grab patch is pinned (inv_mass 0) and thus INVISIBLE to the
+            # sphere collider: if the sphere overruns the anchor -- or the
+            # anchor is dragged into the ball -- the patch parks inside the
+            # shell and tows its whole fabric span in with it (measured 0.47
+            # deep on drift-drag fuzz sessions). Keep the anchor point itself
+            # outside the committed sphere pose, at the same contact distance
+            # the member push-out below uses. Geometric, not rate-limited: the
+            # ejected anchor rides the advancing shell like fabric on its
+            # surface, so it must not lag behind a fast drift.
+            sc = sphere.center + sphere.dc
+            rvec = wp.vec3f(target[0] - sc[0], target[1] - sc[1], target[2] - sc[2])
+            if colliderKind == 1:
+                rvec = wp.vec3f(rvec[0], rvec[1], 0.0)  # rod: radial = xy only
+            rlen = wp.length(rvec)
+            rmin = sphere.radius + sphere.dr + thickness + particleRadius
+            # Stack-aware clamp: the bare contact distance above assumes the
+            # grabbed fabric sits DIRECTLY on the shell, but when the grab
+            # rides a folded stack (drag the top layer of 2-3 folds across
+            # the sphere) the trapped layers under the patch are squeezed
+            # between two hard constraints -- the pinned patch pressed to
+            # bare-shell distance and the final-say sphere projection.
+            # Measured (fold_slide diagnostics): every big transient
+            # violation cluster sits exactly under the grab ON the shell,
+            # with 100-500 free particles in the patch column, and appears
+            # the moment patch height drops below the free-stack height.
+            # Lift the anchor clamp by the stack height in the patch's shadow
+            # column, and (below) each MEMBER's push-out by its own local
+            # column -- the patch is curved, so its down-slope members reach
+            # bare-shell contact while the anchor still hovers. Candidates
+            # exclude the patch's own topological skirt (same-sheet fabric
+            # around the grab rides at patch height and must not read as a
+            # "stack" -- a lone sheet dragged on a bare sphere stays in
+            # normal contact); a folded under-layer is topologically far.
+            stack_cand = None
+            raw_lift = 0.0
+            if anchorStack and rlen - rmin < anchorStackCap + 2.0 * fingerRadius:
+                scn = np.array([sc[0], sc[1], sc[2]])
+                rel_all = pos - scn
+                if colliderKind == 1:
+                    dist_all = np.linalg.norm(rel_all[:, :2], axis=1)
+                else:
+                    dist_all = np.linalg.norm(rel_all, axis=1)
+                sd_all = dist_all - (sphere.radius + sphere.dr)
+                ring = int(np.ceil(fingerRadius / self.spacing)) + 4
+                pr, pc = particle.id // self.numCols, particle.id % self.numCols
+                rows = np.arange(self.numParticles) // self.numCols
+                cols = np.arange(self.numParticles) % self.numCols
+                skirt = (np.abs(rows - pr) <= ring) & (np.abs(cols - pc) <= ring)
+                cand = ((inv_mass > 0.0) & ~skirt
+                        & (sd_all > 0.25 * d_offset) & (sd_all < anchorStackCap))
+                if int(cand.sum()) >= 4:
+                    stack_cand = (rel_all[cand], sd_all[cand])
+                    tv = np.array([target[0], target[1], target[2]]) - scn
+                    if colliderKind == 1:
+                        tv[2] = 0.0  # rod: shadow column along the xy radial
+                    tl = float(np.linalg.norm(tv))
+                    if tl > 1e-9:
+                        u = tv / tl
+                        crel, csd = stack_cand
+                        proj = crel @ u
+                        perp2 = np.einsum('ij,ij->i', crel, crel) - proj * proj
+                        shadow_r = fingerRadius + 2.0 * d_offset
+                        under = (proj > 0.0) & (perp2 < shadow_r * shadow_r)
+                        if int(under.sum()) >= 6:  # a real stack, not stray noise
+                            raw_lift = min(float(np.percentile(csd[under], 90))
+                                           + d_offset, anchorStackCap)
+            if anchorStack:
+                # Smooth the lift state (bounded rise AND bounded decay, see
+                # the anchorLiftStep/Decay note) and apply it geometrically.
+                prev_l = getattr(particle, 'stack_lift', 0.0)
+                lift_a = float(min(max(raw_lift, prev_l - anchorLiftDecay),
+                                   prev_l + anchorLiftStep))
+                lift_a = max(lift_a, 0.0)
+                particle.stack_lift = lift_a
+                rmin += lift_a
+            if rlen < rmin:
+                out = rvec / rlen if rlen > 1e-9 else wp.vec3f(0.0, 1.0, 0.0)
+                if colliderKind == 1:
+                    # rod: eject in the xy plane, keep the free z coordinate
+                    target = wp.vec3f(sc[0] + out[0] * rmin,
+                                      sc[1] + out[1] * rmin,
+                                      target[2])
+                else:
+                    target = wp.vec3f(sc[0] + out[0] * rmin,
+                                      sc[1] + out[1] * rmin,
+                                      sc[2] + out[2] * rmin)
+            gids = [particle.id]
+            goffs = [np.zeros(3)]
+            old_group = particle.group
+            new_group = []
+            # Per-member stack lift: max under-column stack height for each
+            # member's own radial column (the patch is curved -- its low-side
+            # members reach bare-shell contact while the anchor hovers above
+            # its lifted clamp; measured as the residual on-shell violation
+            # bursts with viol_pinned ~0.7 after the anchor-level clamp).
+            member_lift = None
+            if anchorStack and particle.group:
+                n_m = len(particle.group)
+                raw_ml = np.zeros(n_m)
+                if stack_cand is not None:
+                    crel, csd = stack_cand
+                    offs = np.array([[o[0], o[1], o[2]] for _, _, o in particle.group])
+                    mrel = (np.array([target[0], target[1], target[2]]) - scn) + offs
+                    if colliderKind == 1:
+                        mrel[:, 2] = 0.0  # rod: member columns along xy radials
+                    mlen = np.maximum(np.linalg.norm(mrel, axis=1), 1e-9)
+                    mdir = mrel / mlen[:, None]
+                    proj = mdir @ crel.T                     # [n_mem, n_cand]
+                    perp2 = np.einsum('ij,ij->i', crel, crel)[None, :] - proj * proj
+                    col_r = 2.0 * d_offset + 0.5 * self.spacing
+                    in_col = (proj > 0.0) & (perp2 < col_r * col_r)
+                    raw_ml = np.where(
+                        in_col.any(axis=1),
+                        np.minimum(np.where(in_col, csd[None, :], 0.0).max(axis=1)
+                                   + d_offset, anchorStackCap),
+                        0.0)
+                # Same bounded rise/decay smoothing as the anchor lift.
+                prev_ml = getattr(particle, 'member_stack_lift', None)
+                if prev_ml is None or len(prev_ml) != n_m:
+                    prev_ml = np.zeros(n_m)
+                member_lift = np.maximum(
+                    np.minimum(np.maximum(raw_ml, prev_ml - anchorLiftDecay),
+                               prev_ml + anchorLiftStep), 0.0)
+                particle.member_stack_lift = member_lift
+                if not member_lift.any():
+                    member_lift = None
+            for gi, (mid, mmass, off) in enumerate(particle.group):
+                inv_mass[mid] = 0.0
+                p0 = wp.vec3f(target[0] + off[0], target[1] + off[1], target[2] + off[2])
+                r = p0 - (sphere.center + sphere.dc)
+                if colliderKind == 1:
+                    r = wp.vec3f(r[0], r[1], 0.0)  # rod: radial push-out in xy
+                lift = float(member_lift[gi]) if member_lift is not None else 0.0
+                bare_d = wp.length(r) - (sphere.radius + sphere.dr + thickness + particleRadius)
+                d = bare_d - lift
+                off_staged = off
+                if d < 0.0:
+                    # Geometric push to the lifted contact distance; the lift
+                    # itself is already rise/decay-smoothed above, so this
+                    # cannot yank the patch nor sawtooth around the stack top.
+                    push = -d * wp.normalize(r)
+                    # Stage the FULL push-out for this frame's pinned
+                    # placement: a pinned member is invisible to the sphere
+                    # collider, so a staged offset inside the shell IS
+                    # user-visible fabric penetration (fold_slide diagnostics:
+                    # every sphere-penetrating edge during a stack slide had a
+                    # pinned endpoint; the half-folded offset lagged the
+                    # anchor's approach by several frames at ~mem_shell -0.01).
+                    # The STORED offset keeps the original half-fold conform
+                    # so the grip shape still relaxes gradually and anchor
+                    # motion never leaks into the blend.
+                    if grabConformFull:
+                        off_staged = off + push
+                    off = off + 0.5 * push
+                    if not grabConformFull:
+                        off_staged = off
+                gids.append(mid)
+                goffs.append(np.array([off_staged[0], off_staged[1], off_staged[2]]))
                 new_group.append((mid, mmass, off))
             particle.group = new_group
+            # Patch self-crossing veto (see grabVeto/_patch_self_crossed): a
+            # staged shape whose rim folds through itself would lock crossings
+            # for the life of the grab -- reuse the last clean shape instead
+            # (offsets are anchor-relative, so it rides the new target).
+            if grabVeto:
+                tnp = np.array([target[0], target[1], target[2]])
+                staged = [tnp + gof for gof in goffs]
+                if self._patch_self_crossed(particle, gids, staged):
+                    prev_goffs = getattr(particle, "_last_goffs", None)
+                    if prev_goffs is not None and len(prev_goffs) == len(goffs):
+                        goffs = prev_goffs
+                        particle.group = old_group
+                        if os.environ.get("GRAB_DEBUG"):
+                            print("[grab-veto] staged patch self-crossed: "
+                                  "reusing last clean shape", flush=True)
+                else:
+                    particle._last_goffs = [np.array(gof) for gof in goffs]
+            self.activeGrabs.append((particle.prev_target.copy(),
+                                     np.array([target[0], target[1], target[2]]),
+                                     np.array(gids, dtype=np.int32),
+                                     np.array(goffs, dtype=np.float32)))
+            particle.prev_target = np.array([target[0], target[1], target[2]], dtype=np.float64)
 
         self.anchors[:] = [anchor for anchor in self.anchors if anchor.flags & (AnchorFlag.ACTIVE | AnchorFlag.LOCKED)]
+
+        # Rim pair solver (see RIM_SOLVER): rebuild the ring-1 rim pair lists
+        # only when the active grab membership changes (grab / release /
+        # sliding re-grab); simulate() uploads the staged lists when dirty.
+        if rimSolverEnable:
+            grabs = [a for a in self.anchors
+                     if a.flags & AnchorFlag.ACTIVE and a.group]
+            sig = tuple((a.id, a.group[0][0], len(a.group)) for a in grabs)
+            if sig != self._rimSig:
+                self._rimSig = sig
+                members = [np.array([a.id] + [m for m, _, _ in a.group],
+                                    dtype=np.int64) for a in grabs]
+                self._rimStage = self._build_rim_pairs(members, inv_mass)
+                self._rimDirty = True
+
+    def _patch_self_crossed(self, particle, gids, staged):
+        # EXACT self-intersection check of one grab's staged patch surface
+        # (member edges vs non-adjacent member faces, vectorized
+        # Moller-Trumbore on the staged positions). The pinned patch is a hole
+        # in every runtime mechanism -- PDT culls member pairs (ring), the
+        # uncross resolver moves free vertices only, and the device CCD treats
+        # the patch as rigid -- so a CROSSED shape baked into the offsets by
+        # the per-frame conform (curvature-sheared push-outs at the shell
+        # silhouette, per-member stack lifts) locks for the life of the grab.
+        # Probe attribution on the recorded session: the largest in-drag
+        # crossing bursts were mem=5/5 pairs (member edge through member
+        # face). update_anchors vetoes a staged shape that self-crosses and
+        # re-uses the last clean one instead. Cost: only while grabbing, a
+        # few hundred edges x faces, numpy.
+        n = len(gids)
+        if n < 4:
+            return False
+        key = (n, gids[0], gids[-1])
+        topo = getattr(particle, "_patch_topo", None)
+        if topo is None or topo[0] != key:
+            ids = np.asarray(gids, dtype=np.int64)
+            order = np.argsort(ids)
+            sids = ids[order]
+            T = self.hostTriIds
+            E = self.hostEdgeIds
+            def to_idx(arr):
+                p = np.searchsorted(sids, arr)
+                p = np.clip(p, 0, n - 1)
+                ok = sids[p] == arr
+                return order[p], ok
+            ti, tok = to_idx(T)
+            fmask = tok.all(axis=1)
+            ei, eok = to_idx(E)
+            emask = eok.all(axis=1)
+            topo = (key, ei[emask], ti[fmask])
+            particle._patch_topo = topo
+        _, pe, pf = topo
+        if len(pe) == 0 or len(pf) == 0:
+            return False
+        S = np.asarray(staged, dtype=np.float64)
+        # all edge x face pairs, excluding shared-vertex pairs
+        share = (pe[:, 0:1, None] == pf[None, :, :]).any(-1) \
+            | (pe[:, 1:2, None] == pf[None, :, :]).any(-1)
+        epair, fpair = np.nonzero(~share)
+        if len(epair) == 0:
+            return False
+        o = S[pe[epair, 0]]
+        dv = S[pe[epair, 1]] - o
+        v0 = S[pf[fpair, 0]]
+        e1 = S[pf[fpair, 1]] - v0
+        e2 = S[pf[fpair, 2]] - v0
+        h = np.cross(dv, e2)
+        a = np.einsum('ij,ij->i', e1, h)
+        ok = np.abs(a) > 1e-14
+        f = np.zeros_like(a)
+        f[ok] = 1.0 / a[ok]
+        s = o - v0
+        u = f * np.einsum('ij,ij->i', s, h)
+        q = np.cross(s, e1)
+        v = f * np.einsum('ij,ij->i', dv, q)
+        tt = f * np.einsum('ij,ij->i', e2, q)
+        eps = 1e-9
+        hit = ok & (u >= -eps) & (v >= -eps) & (u + v <= 1.0 + eps) \
+            & (tt > 1e-6) & (tt < 1.0 - 1e-6)
+        return bool(hit.any())
+
+    def _uncross_mask(self):
+        # Forcing-site mask for in-drag resolver sweeps (see uncrossMaskR):
+        # balls around every active grab anchor target, plus the sphere shell
+        # while it is being driven. Crossed pairs inside a ball are left to
+        # the post-release path; everything else (the trailing wad) resolves.
+        m = [(np.asarray(target, dtype=np.float64), uncrossMaskR)
+             for _prev, target, _gids, _goffs in self.activeGrabs]
+        if sphere.dc[0] != 0.0 or sphere.dc[1] != 0.0 \
+                or sphere.dc[2] != 0.0 or sphere.dr != 0.0:
+            c = np.array([sphere.center[0], sphere.center[1],
+                          sphere.center[2]], dtype=np.float64)
+            m.append((c, float(sphere.radius) + uncrossMaskR))
+        return m
+
+    def _resolve_crossings(self, max_n=None, mask=None):
+        # Crossing resolver (see the uncross* constants): exact intersection
+        # sweep on the current positions, then a host-side CLUSTER vote that
+        # flips one coherent side of each intersection contour back across
+        # the partner surface (free vertices only, veto'd against creating
+        # new foreign-layer crossings). Runs outside the captured graph,
+        # before the substep replays -- the frame's substeps of PDT/repulsion
+        # then separate the un-crossed pairs on the correct side. Returns the
+        # first sweep's crossing count (0 = clean, drives the idle backoff).
+        # A vertex flipped once this frame is LOCKED against re-flipping by
+        # a later iteration (uncrossIters > 1 is experimental -- see the
+        # cascade note at uncrossIters).
+        im = None
+        found = 0        # first-sweep crossing count (returned for idle backoff)
+        moved = set()    # flipped this frame: final, never flipped again
+        blocked = set()  # veto'd this frame: the pair retries its other endpoint
+        rounds = uncrossIters
+        for _it in range(max(uncrossIters, uncrossBurstIters)):
+            if _it >= rounds:
+                break
+            self.grid.build(self.pos, gridCellSize)
+            self.crossBounds.zero_()
+            wp.launch(kernel=Cloth.max_edge_length,
+                      dim=boundsReduceThreads,
+                      inputs=[self.pos, self.edgeIds],
+                      outputs=[self.crossBounds])
+            self.crossCount.zero_()
+            wp.launch(kernel=Cloth.detect_crossings,
+                      dim=self.numEdges,
+                      inputs=[self.grid.id, self.pos, self.edgeIds, self.triIds,
+                              self.gridRC, self.vertFaceOff, self.vertFaceIds,
+                              self.crossBounds],
+                      outputs=[self.crossPairs, self.crossCount])
+            n = int(self.crossCount.numpy()[0])  # device read: syncs the stream
+            if _it == 0:
+                found = n
+                # Large-wad recovery burst (quiescent path only, see
+                # uncrossBurstN): peel several contour rings this frame.
+                if max_n is None and n > uncrossBurstN:
+                    rounds = max(rounds, uncrossBurstIters)
+            if n == 0 or (max_n is not None and n > max_n):
+                return found
+            if _UNCROSS_DEBUG:
+                print(f"[uncross] it{_it}: {n} crossed pairs", flush=True)
+            n = min(n, maxCross)
+            pairs = self.crossPairs.numpy()[:n]
+            P = self.pos.numpy()
+            if im is None:
+                im = self.hostInvMass.numpy()
+            E = self.hostEdgeIds
+            T = self.hostTriIds
+            disp = {}
+            need = {}      # target vertex -> deepest single-pair flip distance
+            partners = {}  # target vertex -> intended partner face ids
+            recs = []      # (va, vb, f, nf, da, db) per valid crossed pair
+            for e, f in pairs:
+                va, vb = int(E[e, 0]), int(E[e, 1])
+                if mask:
+                    mid = 0.5 * (P[va] + P[vb])
+                    if any(np.linalg.norm(mid - mc) < mr for mc, mr in mask):
+                        continue  # forcing site: leave to post-release
+                i0, i1, i2 = int(T[f, 0]), int(T[f, 1]), int(T[f, 2])
+                a0 = P[i0]
+                nf = np.cross(P[i1] - a0, P[i2] - a0)
+                ln = np.linalg.norm(nf)
+                if ln < 1.0e-12:
+                    continue
+                nf /= ln
+                da = float(np.dot(P[va] - a0, nf))
+                db = float(np.dot(P[vb] - a0, nf))
+                if da * db > 0.0:
+                    continue  # float-noise mismatch with the exact test: skip
+                recs.append((va, vb, int(f), nf, da, db))
+
+            def add_flip(s, ds, nf, f):
+                step = -np.sign(ds) * (abs(ds) + uncrossMargin) * nf
+                disp[s] = disp.get(s, 0.0) + step
+                need[s] = max(need.get(s, 0.0), abs(ds) + uncrossMargin)
+                partners.setdefault(s, []).append(f)
+
+            if uncrossVote == "pair":
+                # independent per-pair least-motion (fallback policy)
+                for va, vb, f, nf, da, db in recs:
+                    s, ds = (va, da) if abs(da) <= abs(db) else (vb, db)
+                    o, do_ = (vb, db) if s == va else (va, da)
+                    if im[s] == 0.0 or s in moved or s in blocked:
+                        s, ds = o, do_
+                        if im[s] == 0.0 or s in moved or s in blocked:
+                            continue
+                    add_flip(s, ds, nf, f)
+            else:
+                # CLUSTER vote: union-find the crossing edges into contour
+                # clusters (shared endpoints) and flip ONE coherent side per
+                # cluster. Per-pair least-motion picks incoherent directions
+                # along a band (each pair flips its own shallow endpoint,
+                # which for a deep intrusion ADVANCES the front instead of
+                # retracting it -- measured as a growing contour). The side
+                # with fewer vertices (the intruded tongue) flips; on a tie,
+                # the side with the smaller total depth (least region
+                # motion).
+                parent = {}
+
+                def find(x):
+                    while parent.get(x, x) != x:
+                        parent[x] = parent.get(parent[x], parent[x])
+                        x = parent[x]
+                    return x
+
+                def union(x, y):
+                    rx, ry = find(x), find(y)
+                    if rx != ry:
+                        parent[rx] = ry
+
+                vdep = {}
+                for va, vb, f, nf, da, db in recs:
+                    union(va, vb)
+                    vdep.setdefault(va, []).append((da, nf, f))
+                    vdep.setdefault(vb, []).append((db, nf, f))
+                clusters = {}
+                for v in vdep:
+                    clusters.setdefault(find(v), []).append(v)
+                for members in clusters.values():
+                    dsum = {v: sum(d for d, _, _ in vdep[v]) for v in members}
+                    plus = [v for v in members if dsum[v] > 0.0]
+                    minus = [v for v in members if dsum[v] <= 0.0]
+                    if len(plus) != len(minus):
+                        flip = plus if len(plus) < len(minus) else minus
+                    else:
+                        dp = sum(abs(dsum[v]) for v in plus)
+                        dm = sum(abs(dsum[v]) for v in minus)
+                        flip = plus if dp <= dm else minus
+                    for v in flip:
+                        if im[v] == 0.0 or v in moved or v in blocked:
+                            continue
+                        for d, nf, f in vdep[v]:
+                            add_flip(v, d, nf, f)
+            if not disp:
+                return found
+            # Regional dilation (see uncrossDilate): drag each flip's grid
+            # neighborhood along so the pleat lobe moves bodily instead of
+            # having its crossed ring yanked back by interior tension.
+            if uncrossDilate > 0:
+                nrows = self.numParticles // self.numCols
+                frontier = dict(disp)
+                for _ring in range(uncrossDilate):
+                    acc = {}
+                    for v, dvv in frontier.items():
+                        r, c = v // self.numCols, v % self.numCols
+                        if r > 0:
+                            acc.setdefault(v - self.numCols, []).append((v, dvv))
+                        if r < nrows - 1:
+                            acc.setdefault(v + self.numCols, []).append((v, dvv))
+                        if c > 0:
+                            acc.setdefault(v - 1, []).append((v, dvv))
+                        if c < self.numCols - 1:
+                            acc.setdefault(v + 1, []).append((v, dvv))
+                    frontier = {}
+                    for u, contrib in acc.items():
+                        if u in disp or u in moved or u in blocked \
+                                or im[u] == 0.0:
+                            continue
+                        step = uncrossDilateGain \
+                            * (sum(d for _, d in contrib) / len(contrib))
+                        disp[u] = step
+                        need[u] = float(np.linalg.norm(step))
+                        # veto allowed-set: inherit the contributing seeds'
+                        # intended partner faces
+                        pl = partners.setdefault(u, [])
+                        for sv, _ in contrib:
+                            pl.extend(partners.get(sv, ()))
+                        frontier[u] = step
+            ids = np.fromiter(disp.keys(), dtype=np.int32, count=len(disp))
+            dv = np.stack([disp[int(i)] for i in ids]).astype(np.float32)
+            mag = np.linalg.norm(dv, axis=1)
+            # DEPTH-COMPLETE step cap (see uncrossStepMax): a flip that cannot
+            # reach past the partner plane is worse than useless -- it lands
+            # the vertex still-crossed at d in [farBarrierFloor, 1)*d_offset,
+            # where the c<0 barrier plane truncates its return motion and the
+            # recovery push drives it deeper: the flip is undone within the
+            # frame's substeps (measured on the locked 400x400 recorded wad:
+            # depth med 0.0069 / p90 0.0089 vs the old fixed 0.00675 cap ->
+            # ~180 flips/frame applied, net drain ~2 pairs/frame, reads as a
+            # permanently locked knot). Cap each vertex by what it NEEDS to
+            # cross its own deepest partner plane (+margin), floored at the
+            # legacy uncrossStep, bounded by uncrossStepMax; the no-new-
+            # crossing veto below exact-tests the full longer segment, so a
+            # deep flip through a third layer is still rejected.
+            cap = np.fromiter(
+                (min(max(need[int(i)], uncrossStep), uncrossStepMax)
+                 for i in ids), dtype=np.float64, count=len(ids))
+            over = mag > cap
+            dv[over] *= (cap[over] / mag[over])[:, None]
+            # NO-NEW-CROSSING VETO: in a multi-layer pile (or a tightly
+            # creased fold, where the "layers" are material neighbors),
+            # flipping a vertex across its partner sheet B can carry it
+            # THROUGH a third layer sitting just behind -- the next frame's
+            # sweep then flips it back (oscillation: the knot never resolves,
+            # and the churn pumps stretch). Exact-test each flip segment
+            # against the nearby faces; only the recorded partner faces and
+            # their vertex-adjacent neighbors (the same local surface, in
+            # case the segment exits through a coplanar neighbor of f) may be
+            # crossed -- ANY other face vetoes the flip. A vetoed vertex is
+            # blocked for this frame so the pair retries with its other
+            # endpoint next iteration.
+            P0 = P[ids]
+            P1 = P0 + dv
+            lo = np.minimum(P0, P1).min(axis=0) - 0.03
+            hi = np.maximum(P0, P1).max(axis=0) + 0.03
+            tc = (P[T[:, 0]] + P[T[:, 1]] + P[T[:, 2]]) / 3.0
+            tr = np.maximum(np.linalg.norm(P[T[:, 0]] - tc, axis=1),
+                            np.maximum(np.linalg.norm(P[T[:, 1]] - tc, axis=1),
+                                       np.linalg.norm(P[T[:, 2]] - tc, axis=1)))
+            cand = np.nonzero(np.all((tc + tr[:, None] >= lo)
+                                     & (tc - tr[:, None] <= hi), axis=1))[0]
+            keep = np.ones(len(ids), dtype=bool)
+            if len(cand) and uncrossVetoVec:
+                # VECTORIZED veto (2026-09): the per-flip loop below tests
+                # every flip against EVERY face in the joint bbox -- O(flips
+                # x bbox faces), ~5 s per round on a 2k-pair 400^2 wad
+                # spread across the pile (10k dilated flips x 100k faces),
+                # i.e. minutes per recovery frame with burst rounds and the
+                # settle-interleave. Same candidate semantics (every face
+                # whose centroid lies within slen + tr + 1e-5 of the segment
+                # midpoint), found through a uniform grid on the candidate
+                # face centroids and tested with one batched Moller-Trumbore
+                # over the (flip, face) pairs. UNCROSS_VETO_VEC=0 restores
+                # the loop; UNCROSS_VETO_CHECK=1 runs both and asserts.
+                keep = self._veto_flips_vec(ids, dv, P0, P, T, cand, tc, tr,
+                                            partners)
+                if uncrossVetoCheck:
+                    keep_ref = self._veto_flips_loop(ids, dv, P0, P, T, cand,
+                                                     tc, tr, partners, set())
+                    if not np.array_equal(keep, keep_ref):
+                        raise AssertionError(
+                            f"[uncross] veto mismatch: vec {int((~keep).sum())} "
+                            f"vs loop {int((~keep_ref).sum())} vetoes")
+                for s in ids[~keep]:
+                    blocked.add(int(s))
+            elif len(cand):
+                keep = self._veto_flips_loop(ids, dv, P0, P, T, cand, tc, tr,
+                                             partners, blocked)
+            if _UNCROSS_DEBUG:
+                print(f"[uncross]   apply={int(keep.sum())} veto={int((~keep).sum())}",
+                      flush=True)
+            ids = ids[keep]
+            dv = dv[keep]
+            if not len(ids):
+                continue  # everything veto'd: retry other endpoints next iter
+            moved.update(int(i) for i in ids)
+            wp.launch(kernel=Cloth.apply_uncross,
+                      dim=len(ids),
+                      inputs=[wp.array(ids, dtype=wp.int32),
+                              wp.array(dv, dtype=wp.vec3), self.pos])
+        return found
+
+    def _allowed_codes(self, ids, partners, T, ks):
+        # (flip index k, face f) codes of the faces a flip segment MAY cross:
+        # its recorded partner faces and their vertex-adjacent neighbors --
+        # only for the flips ks that still have an external candidate.
+        vfo = self.hostVertFaceOff
+        vfi = self.hostVertFaceIds
+        nT = T.shape[0]
+        codes = []
+        cache = {}   # dilated flips inherit their seeds' lists: share the work
+        for k in ks:
+            k = int(k)
+            pl = partners[int(ids[k])]
+            if not pl:
+                continue
+            key = tuple(sorted(set(pl)))
+            fs = cache.get(key)
+            if fs is None:
+                pf = np.asarray(key, dtype=np.int64)
+                verts = np.unique(T[pf].ravel())
+                parts = [pf]
+                for pv in verts:
+                    parts.append(vfi[vfo[pv]:vfo[pv + 1]].astype(np.int64))
+                fs = cache[key] = np.unique(np.concatenate(parts))
+            codes.append(k * nT + fs)
+        if not codes:
+            return np.zeros(0, dtype=np.int64)
+        return np.unique(np.concatenate(codes))
+
+    def _veto_flips_vec(self, ids, dv, P0, P, T, cand, tc, tr, partners):
+        n = len(ids)
+        keep = np.ones(n, dtype=bool)
+        tcc = tc[cand]
+        trc = tr[cand]
+        smid = P0 + 0.5 * dv
+        slen = 0.5 * np.linalg.norm(dv, axis=1)
+        reach = slen + float(trc.max()) + 1e-5          # per-flip search radius
+        cell = float(reach.max()) + 1e-6
+        # uniform grid over the candidate centroids
+        origin = np.minimum(tcc.min(axis=0), smid.min(axis=0)) - cell
+        fk = np.floor((tcc - origin) / cell).astype(np.int64)
+        dims = fk.max(axis=0) + 3
+        fkey = (fk[:, 0] * dims[1] + fk[:, 1]) * dims[2] + fk[:, 2]
+        order = np.argsort(fkey, kind="stable")
+        fkey_s = fkey[order]
+        sk = np.floor((smid - origin) / cell).astype(np.int64)
+        offs = np.array([(i, j, l) for i in (-1, 0, 1) for j in (-1, 0, 1)
+                         for l in (-1, 0, 1)], dtype=np.int64)
+        nk = sk[:, None, :] + offs[None, :, :]                     # [n, 27, 3]
+        nk = np.clip(nk, 0, dims - 1)
+        nkey = ((nk[..., 0] * dims[1] + nk[..., 1]) * dims[2]
+                + nk[..., 2]).reshape(-1)                            # [n*27]
+        lo_i = np.searchsorted(fkey_s, nkey, side="left")
+        hi_i = np.searchsorted(fkey_s, nkey, side="right")
+        cnt = hi_i - lo_i
+        tot = int(cnt.sum())
+        if tot == 0:
+            return keep
+        # expand the (flip, cell) ranges into (flip, cand-face) pairs
+        rep_k = np.repeat(np.arange(n * 27) // 27, cnt)
+        starts = np.repeat(lo_i, cnt)
+        within = np.arange(tot) - np.repeat(np.cumsum(cnt) - cnt, cnt)
+        pj = order[starts + within]                                  # cand index
+        pk = rep_k
+        # distance filter (identical to the loop's `near`)
+        near = np.linalg.norm(tcc[pj] - smid[pk], axis=1) <= slen[pk] + trc[pj] + 1e-5
+        pk = pk[near]; pj = pj[near]
+        if not len(pk):
+            return keep
+        # exclude the flip vertex's own faces and its allowed set
+        Tc = T[cand]
+        own = (Tc[pj] == ids[pk][:, None]).any(axis=1)
+        pk = pk[~own]; pj = pj[~own]
+        if not len(pk):
+            return keep
+        nT = T.shape[0]
+        allowed = self._allowed_codes(ids, partners, T, np.unique(pk))
+        if len(allowed):
+            codes = pk.astype(np.int64) * nT + cand[pj].astype(np.int64)
+            ext = ~np.isin(codes, allowed, assume_unique=False)
+            pk = pk[ext]; pj = pj[ext]
+            if not len(pk):
+                return keep
+        # batched Moller-Trumbore, same tolerances as the loop
+        A = P[Tc[pj, 0]]
+        E1 = P[Tc[pj, 1]] - A
+        E2 = P[Tc[pj, 2]] - A
+        d = dv[pk]
+        h = np.cross(d, E2)
+        det = np.einsum('ij,ij->i', E1, h)
+        ok = np.abs(det) > 1e-14
+        inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+        sv = P0[pk] - A
+        u = np.einsum('ij,ij->i', sv, h) * inv
+        q = np.cross(sv, E1)
+        vpar = np.einsum('ij,ij->i', d, q) * inv
+        tpar = np.einsum('ij,ij->i', E2, q) * inv
+        hit = ok & (u >= 0) & (vpar >= 0) & (u + vpar <= 1) & (tpar > 0) & (tpar < 1)
+        if hit.any():
+            keep[np.unique(pk[hit])] = False
+        return keep
+
+    def _veto_flips_loop(self, ids, dv, P0, P, T, cand, tc, tr, partners, blocked):
+        keep = np.ones(len(ids), dtype=bool)
+        if len(cand):
+            Tc = T[cand]
+            tcc = tc[cand]
+            trc = tr[cand]
+            A = P[Tc[:, 0]]
+            E1 = P[Tc[:, 1]] - A
+            E2 = P[Tc[:, 2]] - A
+            vfo = self.hostVertFaceOff
+            vfi = self.hostVertFaceIds
+            for k in range(len(ids)):
+                s = int(ids[k])
+                d = dv[k]
+                smid = P0[k] + 0.5 * d
+                slen = 0.5 * np.linalg.norm(d)
+                near = np.linalg.norm(tcc - smid, axis=1) <= slen + trc + 1e-5
+                if not near.any():
+                    continue
+                j = np.nonzero(near)[0]
+                # allowed set: the intended partner faces + their
+                # vertex-adjacent neighbors (same local surface patch)
+                allowed = set()
+                for pf in partners[s]:
+                    allowed.add(pf)
+                    for pv in T[pf]:
+                        allowed.update(
+                            int(x) for x in vfi[vfo[pv]:vfo[pv + 1]])
+                own = (Tc[j] == s).any(axis=1)
+                ext = np.array([int(cand[x]) not in allowed
+                                for x in j], dtype=bool)
+                j = j[~own & ext]
+                if not len(j):
+                    continue
+                h = np.cross(d, E2[j])
+                det = np.einsum('ij,ij->i', E1[j], h)
+                ok = np.abs(det) > 1e-14
+                inv = np.where(ok, 1.0 / np.where(ok, det, 1.0), 0.0)
+                sv = P0[k] - A[j]
+                u = np.einsum('ij,ij->i', sv, h) * inv
+                q = np.cross(sv, E1[j])
+                vpar = np.einsum('j,ij->i', d, q) * inv
+                tpar = np.einsum('ij,ij->i', E2[j], q) * inv
+                hit = ok & (u >= 0) & (vpar >= 0) & (u + vpar <= 1) \
+                    & (tpar > 0) & (tpar < 1)
+                if hit.any():
+                    keep[k] = False
+                    blocked.add(s)
+        return keep
 
     def simulate(self, steps=numSubsteps, iterations=numIterations, integrate=True, self_collision=True, solve_constraints=True):
         dt = timeStep / numSubsteps
 
         wp.copy(self.pos, self.hostPos)
         wp.copy(self.invMass, self.hostInvMass)
+
+        # The resolver only acts on QUIESCENT-CONTROL frames (no active grab,
+        # sphere not being driven): during sustained forcing the 30 substeps
+        # of plow re-cross whatever one host-side pass uncrosses, and the
+        # fight churns the pressed pile (measured: worse outcomes and stretch
+        # blow-ups with in-drag resolution). Post-release -- where persistent
+        # knots actually matter -- it untangles within a few frames.
+        quiescent = (not self.activeGrabs
+                     and sphere.dc[0] == 0.0 and sphere.dc[1] == 0.0
+                     and sphere.dc[2] == 0.0 and sphere.dr == 0.0)
+        self._uncrossFrame = getattr(self, "_uncrossFrame", 0) + 1
+        recovery_found = 0  # this frame's quiescent sweep count (interleave gate)
+        if uncrossEnable and self_collision:
+            # Idle backoff: a clean sweep costs ~3.5 ms/frame at 400x400 (grid
+            # build + per-edge walk + sync) and a settled scene stays clean,
+            # so after each empty sweep the cadence decays 1 -> 2 -> 4 frames;
+            # any hit (or an interaction ending) restores full rate.
+            skip = getattr(self, "_uncrossSkip", 0)
+            if quiescent or not uncrossGated:
+                if skip > 0:
+                    self._uncrossSkip = skip - 1
+                else:
+                    found = recovery_found = self._resolve_crossings()
+                    back = getattr(self, "_uncrossBackoff", 0)
+                    if found == 0:
+                        self._uncrossBackoff = min(max(back, 1) * 2, 4)
+                        self._uncrossSkip = self._uncrossBackoff - 1
+                    else:
+                        self._uncrossBackoff = 0
+                        self._uncrossSkip = 0
+            elif (uncrossForcedEvery > 0
+                  and self._uncrossFrame % uncrossForcedEvery == 0):
+                # In-drag sweep with the forcing sites masked out (see the
+                # uncrossForcedEvery block): prunes the trailing wad while
+                # the user still drags, so release starts near-clean.
+                # (Default OFF: unmasked-unbraked variants measured harmful.)
+                self._resolve_crossings(max_n=uncrossForcedMaxN,
+                                        mask=self._uncross_mask())
+                self._uncrossSkip = 0
+                self._uncrossBackoff = 0
+            elif (uncrossDrag and grabBrakeK > 0.0 and self.activeGrabs
+                    and getattr(self, "_lastCrossTotal", 0) > 0
+                    and self._uncrossFrame % uncrossDragEvery == 0):
+                # In-drag resolution (see UNCROSS_DRAG): fires only while the
+                # brake's sweep is reporting actual crossings under an active
+                # grab, i.e. exactly when the anchor is throttled -- the brake
+                # holds creation below the resolver's drain rate (in-drag
+                # resolution WITHOUT the brake loses to the plow's creation
+                # rate; measured 96->745).
+                self._resolve_crossings(max_n=uncrossForcedMaxN)
+                self._uncrossSkip = 0
+                self._uncrossBackoff = 0
+
+        # Crossed-vertex flags for the side-aware barrier (see FLAG_GUARD) and
+        # the crossing-brake signal (see GRAB_BRAKE): while a grab is active,
+        # run the resolver's exact intersection sweep on the frame-start
+        # positions and scatter the involved vertices into crossedFlag --
+        # entirely on-device, no host readback here, so it adds no sync point
+        # (the brake reads the count after the frame's existing sync). The
+        # narrowphase consults the flags only while n_grabs > 0, so the
+        # buffer being stale outside grabs is harmless.
+        self._crossSwept = ((flagGuardEnable or grabBrakeK > 0.0)
+                            and self_collision and bool(self.activeGrabs))
+        if self._crossSwept:
+            self.grid.build(self.pos, gridCellSize)
+            self.crossBounds.zero_()
+            wp.launch(kernel=Cloth.max_edge_length,
+                      dim=boundsReduceThreads,
+                      inputs=[self.pos, self.edgeIds],
+                      outputs=[self.crossBounds])
+            self.crossCount.zero_()
+            wp.launch(kernel=Cloth.detect_crossings,
+                      dim=self.numEdges,
+                      inputs=[self.grid.id, self.pos, self.edgeIds, self.triIds,
+                              self.gridRC, self.vertFaceOff, self.vertFaceIds,
+                              self.crossBounds],
+                      outputs=[self.crossPairs, self.crossCount])
+            self.crossedFlag.zero_()
+            wp.launch(kernel=Cloth.scatter_crossed_flags,
+                      dim=maxCross,
+                      inputs=[self.crossPairs, self.crossCount, self.edgeIds,
+                              self.triIds],
+                      outputs=[self.crossedFlag])
 
         # Capture one substep ONCE per flag combination and replay it across frames.
         # Everything per-frame (collider pose and delta slices) lives in device
@@ -2619,8 +5775,78 @@ class Cloth(Input):
         self.colliderCenter.fill_(sphere.center)
         self.colliderRadius.fill_(sphere.radius)
         self.selfCollisionOverflow.zero_()  # per-frame; accumulates over the replayed substeps
-        for _ in range(steps):
-            wp.capture_launch(graph)
+        self.grabPressure.zero_()           # per-frame grip-load accumulators
+        self.grabPressureMag.zero_()
+
+        # Pack the grab anchors for the per-substep sweep. activeGrabs entries are
+        # (prev, target, ids, offs): prev = last frame's committed anchor point,
+        # target = where this frame should end; each substep moves the patch by
+        # (target - prev) / steps (see advance/apply_grab_anchors in step()).
+        n_members = 0
+        if self.activeGrabs:
+            ids_np = np.zeros(maxGrabMembers, dtype=np.int32)
+            ax_np = np.zeros(maxGrabMembers, dtype=np.int32)
+            off_np = np.zeros((maxGrabMembers, 3), dtype=np.float32)
+            pos_np = np.zeros((maxGrabs, 3), dtype=np.float32)
+            dlt_np = np.zeros((maxGrabs, 3), dtype=np.float32)
+            for gi, (prev, target, gids, goffs) in enumerate(self.activeGrabs[:maxGrabs]):
+                n = min(len(gids), maxGrabMembers - n_members)
+                if n < len(gids):
+                    print(f"[grab] member buffer full: dropping {len(gids) - n}", flush=True)
+                ids_np[n_members:n_members + n] = gids[:n]
+                ax_np[n_members:n_members + n] = gi
+                off_np[n_members:n_members + n] = goffs[:n]
+                pos_np[gi] = prev
+                dlt_np[gi] = (np.asarray(target) - np.asarray(prev)) / float(steps)
+                n_members += n
+            wp.copy(self.anchorMemberIds, wp.array(ids_np, dtype=wp.int32))
+            wp.copy(self.anchorMemberAx, wp.array(ax_np, dtype=wp.int32))
+            wp.copy(self.anchorMemberOff, wp.array(off_np, dtype=wp.vec3))
+            wp.copy(self.anchorPos, wp.array(pos_np, dtype=wp.vec3))
+            wp.copy(self.anchorDelta, wp.array(dlt_np, dtype=wp.vec3))
+        self.anchorMemberCount.fill_(n_members)
+        self.anchorCount.fill_(min(len(self.activeGrabs), maxGrabs))
+
+        # Rim pair solver: upload the staged pair lists when membership changed
+        # (see update_anchors); counts live on device so the graph is invariant.
+        if rimSolverEnable and self._rimDirty:
+            vt_np, ee_np = self._rimStage
+            n_vt = min(len(vt_np), maxRimVT)
+            n_ee = min(len(ee_np), maxRimEE)
+            if len(vt_np) > maxRimVT or len(ee_np) > maxRimEE:
+                print(f"[rim] pair buffer full: dropping "
+                      f"{len(vt_np) - n_vt} VT / {len(ee_np) - n_ee} EE", flush=True)
+            buf = np.zeros((maxRimVT, 4), dtype=np.int32)
+            buf[:n_vt] = vt_np[:n_vt]
+            wp.copy(self.rimVTPairs, wp.array(buf, dtype=wp.int32))
+            buf = np.zeros((maxRimEE, 4), dtype=np.int32)
+            buf[:n_ee] = ee_np[:n_ee]
+            wp.copy(self.rimEEPairs, wp.array(buf, dtype=wp.int32))
+            self.rimVTCount.fill_(n_vt)
+            self.rimEECount.fill_(n_ee)
+            self._rimDirty = False
+
+        # Settle-interleaved recovery (see uncrossInterleave): on a quiescent
+        # frame whose sweep found a large wad, resolve again between substep
+        # chunks -- each pass then acts on constraint-relaxed geometry.
+        # Moving pos between chunks is exactly as safe as between frames: the
+        # next substep's integrate freezes the flipped positions into
+        # prev_pos, so no kinetic energy is injected.
+        if uncrossInterleave > 1 and recovery_found > uncrossBurstN:
+            inter = uncrossInterleaveBig \
+                if recovery_found > uncrossInterleaveBigN else uncrossInterleave
+            per = (steps + inter - 1) // inter
+            done = 0
+            while done < steps:
+                cnt = min(per, steps - done)
+                for _ in range(cnt):
+                    wp.capture_launch(graph)
+                done += cnt
+                if done < steps:
+                    self._resolve_crossings()
+        else:
+            for _ in range(steps):
+                wp.capture_launch(graph)
 
         wp.copy(self.hostPos, self.pos)
         # hostPos is a PINNED cpu array, so the D2H copy above is issued as an
@@ -2630,6 +5856,38 @@ class Cloth(Input):
         # yielding stale positions (looks like deep collider penetration during a
         # fast sphere drag). Sync so the buffer is complete before any host read.
         wp.synchronize_stream()
+
+        # Load-yielding grip: read back this frame's per-grab plow pressure, keyed
+        # by each grab's primary particle id, for next update_anchors to yield on.
+        if self.activeGrabs and n_members > 0:
+            pv = self.grabPressure.numpy()
+            pm = self.grabPressureMag.numpy()
+            self.grabPressureHost = {
+                int(g[2][0]): (pv[gi].copy(), float(pm[gi]), max(len(g[2]), 1))
+                for gi, g in enumerate(self.activeGrabs[:maxGrabs])}
+        else:
+            self.grabPressureHost = {}
+
+        # Crossing-brake signal (see GRAB_BRAKE): per-grab count of exact
+        # crossings near the anchor, from this frame's sweep (the stream is
+        # already synced above, so the reads are cheap and coherent). Keyed by
+        # primary particle id like grabPressureHost; consumed by the next
+        # update_anchors.
+        self.crossNearHost = {}
+        self._lastCrossTotal = 0
+        if getattr(self, "_crossSwept", False) and grabBrakeK > 0.0 \
+                and self.activeGrabs:
+            n_cross = int(self.crossCount.numpy()[0])
+            self._lastCrossTotal = n_cross
+            if n_cross > 0:
+                pairs = self.crossPairs.numpy()[:min(n_cross, maxCross)]
+                P = self.hostPos.numpy()
+                mids = 0.5 * (P[self.hostEdgeIds[pairs[:, 0], 0]]
+                              + P[self.hostEdgeIds[pairs[:, 0], 1]])
+                for g in self.activeGrabs[:maxGrabs]:
+                    anch = np.asarray(g[1], dtype=np.float64)
+                    self.crossNearHost[int(g[2][0])] = int(
+                        (np.linalg.norm(mids - anch, axis=1) < grabBrakeR).sum())
 
     def step(self, dt: float, iterations=numIterations, integrate=True, self_collision=True, solve_constraints=True,
              build_grid=True):
@@ -2658,6 +5916,18 @@ class Cloth(Input):
                           self.pos,
                           self.vel,
                       ])
+
+        # Sweep grabbed patches by one substep slice (no-ops when nothing is
+        # grabbed: anchorMemberCount is 0). After integrate so prev_pos holds the
+        # pre-move state and the move is a proper swept displacement.
+        wp.launch(kernel=Cloth.advance_grab_anchors,
+                  dim=maxGrabs,
+                  inputs=[self.anchorPos, self.anchorDelta])
+        wp.launch(kernel=Cloth.apply_grab_anchors,
+                  dim=maxGrabMembers,
+                  inputs=[self.anchorMemberCount, self.anchorMemberIds,
+                          self.anchorMemberAx, self.anchorMemberOff,
+                          self.anchorPos, self.pos])
 
         if solve_constraints:
             self.distConstraints.lambdas.zero_()
@@ -2730,7 +6000,7 @@ class Cloth(Input):
                       dim=self.numEdges,
                       inputs=[self.invMass, self.pos, self.edgeIds, self.edgeRestLen],
                       outputs=[self.deltas])
-            if _sl_it == 0:
+            if _sl_it == 0 and ringFloorEnable:
                 # ring_floor is a rare-fire guard (fold-through only): once per
                 # block converges across substeps; 12x/substep cost ~3 ms/frame.
                 wp.launch(kernel=Cloth.ring_floor,
@@ -2748,7 +6018,7 @@ class Cloth(Input):
         wp.launch(kernel=Cloth.clamp_displacement,
                   dim=self.numParticles,
                   inputs=[self.invMass, self.prevPos, self.pos,
-                          self.truncation_ts, self.push])
+                          self.truncation_ts, self.push, self.pushLimit])
 
         # Planar Divide-and-Truncate: clamp the net per-vertex displacement so no
         # vertex crosses a plane that separated it from a nearby triangle (vertex-
@@ -2834,6 +6104,49 @@ class Cloth(Input):
                               self.ovSweep],
                       outputs=[self.eeCount, self.eeBuf,
                                self.selfCollisionOverflow])
+            if farDebug:
+                wp.copy(self.dbgPosDet, self.pos)
+            # CONTACT REPULSION: soft unilateral pressure over the cached
+            # candidate pairs, on CURRENT positions, sandwiched between the
+            # candidate build and the truncation narrowphase so the PDT planes
+            # (built from the frozen reference, applied to the NET displacement
+            # including these deltas) veto any repulsion overshoot. deltas is
+            # free here (the strain-limit block re-zeroed it via add_deltas).
+            for _rp_it in range(repulsionIters):
+                wp.launch(kernel=Cloth.contact_repulsion,
+                          dim=self.numParticles,
+                          inputs=[self.triIds, self.invMass, self.pos,
+                                  self.prevPos, self.vtCount, self.vtBuf],
+                          outputs=[self.deltas])
+                # EE pass on the first repulsionEE iterations only: eeBuf is
+                # ~3x vtBuf, so the edge pass dominates the repulsion cost;
+                # one EE pass keeps the drape frame time at the control mean
+                # while two blew the 10% budget (+19%).
+                if repulsionEE > _rp_it:
+                    wp.launch(kernel=Cloth.contact_repulsion_edges,
+                              dim=self.numEdges,
+                              inputs=[self.invMass, self.pos, self.prevPos,
+                                      self.edgeIds, self.eeCount, self.eeBuf],
+                              outputs=[self.deltas])
+                wp.launch(kernel=Cloth.add_deltas,
+                          dim=self.numParticles,
+                          inputs=[self.pos, self.deltas])
+            # PINCH EXTRUSION: bounded tangential escape for fabric squeezed
+            # between the shell and the floor (pressure-gated by vtCount). Runs
+            # before the narrowphase so the PDT planes veto any extrusion step
+            # that would cross a neighboring sheet.
+            wp.launch(kernel=Cloth.pinch_extrude,
+                      dim=self.numParticles,
+                      inputs=[self.invMass, self.pos,
+                              self.colliderCenter, self.colliderRadius,
+                              self.colliderDeltaC, self.colliderDeltaR,
+                              self.vtCount],
+                      outputs=[self.deltas])
+            wp.launch(kernel=Cloth.add_deltas,
+                      dim=self.numParticles,
+                      inputs=[self.pos, self.deltas])
+            if farDebug:
+                wp.copy(self.dbgPosNar, self.pos)
             # NARROWPHASE (query-free -> high occupancy). Reads the caches, does the
             # DIVIDE/TRUNCATE; both passes write the same truncation_ts (atomic_min) and
             # push (atomic_add) buffers as before.
@@ -2846,10 +6159,13 @@ class Cloth(Input):
                           self.pos,
                           self.vtCount,
                           self.vtBuf,
+                          self.anchorCount,
+                          self.crossedFlag,
                       ],
                       outputs=[
                           self.truncation_ts,
                           self.push,
+                          self.pushLimit,
                       ])
             wp.launch(kernel=Cloth.self_collision_truncate_edges,
                       dim=self.numEdges,
@@ -2860,14 +6176,45 @@ class Cloth(Input):
                           self.edgeIds,
                           self.eeCount,
                           self.eeBuf,
+                          self.anchorCount,
+                          self.crossedFlag,
                       ],
                       outputs=[
                           self.truncation_ts,
                           self.push,
+                          self.pushLimit,
                       ])
+            # Rim pair solver (see RIM_SOLVER): the grab rim's ring-1 pairs --
+            # culled from every pass above by design -- get their own reduced-
+            # offset DIVIDE/TRUNCATE into the same truncation_ts/push buffers.
+            # No-op (early-out on count) when nothing is grabbed.
+            if rimSolverEnable:
+                wp.launch(kernel=Cloth.rim_truncate_vt,
+                          dim=maxRimVT,
+                          inputs=[self.invMass, self.prevPos, self.pos,
+                                  self.rimVTPairs, self.rimVTCount],
+                          outputs=[self.truncation_ts, self.push])
+                wp.launch(kernel=Cloth.rim_truncate_ee,
+                          dim=maxRimEE,
+                          inputs=[self.invMass, self.prevPos, self.pos,
+                                  self.rimEEPairs, self.rimEECount],
+                          outputs=[self.truncation_ts, self.push])
             wp.launch(kernel=Cloth.apply_truncation,
                       dim=self.numParticles,
-                      inputs=[self.invMass, self.prevPos, self.pos, self.truncation_ts, self.push])
+                      inputs=[self.invMass, self.prevPos, self.pos, self.truncation_ts, self.push,
+                              self.pushLimit,
+                              self.colliderCenter, self.colliderRadius,
+                              self.colliderDeltaC, self.colliderDeltaR])
+            if farDebug:
+                wp.copy(self.dbgPosPDT, self.pos)
+            # Load-yielding grip: fold this substep's grabbed-member pressure
+            # shares into the per-grab frame accumulators (no-op when nothing is
+            # grabbed: anchorMemberCount is 0).
+            wp.launch(kernel=Cloth.accumulate_grab_pressure,
+                      dim=maxGrabMembers,
+                      inputs=[self.anchorMemberCount, self.anchorMemberIds,
+                              self.anchorMemberAx, self.push,
+                              self.grabPressure, self.grabPressureMag])
 
         # Swept-CCD sphere projection + ground contact run last so their
         # penetration-free result has final say over the substep. The sphere's
@@ -2891,6 +6238,7 @@ class Cloth(Input):
                       self.colliderDeltaC,
                       self.colliderDeltaR,
                       self.colliderDeltaQ,
+                      self.vtCount,
                   ])
         # Edge-vs-sphere pass: keeps the FABRIC (not just its vertices) out of the
         # sphere -- under load the cloth stretches until the sphere fits between
@@ -2935,7 +6283,7 @@ class Cloth(Input):
                       dim=self.numEdges,
                       inputs=[self.invMass, self.pos, self.edgeIds, self.edgeRestLen],
                       outputs=[self.deltas])
-            if _sl_it == 0:
+            if _sl_it == 0 and ringFloorEnable:
                 wp.launch(kernel=Cloth.ring_floor,
                           dim=self.numRingPairs,
                           inputs=[self.invMass, self.pos, self.ringPairs],
@@ -2968,6 +6316,15 @@ class Cloth(Input):
 
         # Advance the collider pose only after every consumer of this substep's
         # pose (vertex pass, edge passes, post-limit closing block) has run.
+        # Fingertip collider: after the shell/ground have final-said, evict
+        # free fabric from the grip volume (no-op when nothing is grabbed).
+        if farDebug:
+            wp.copy(self.dbgPosCol, self.pos)
+        wp.launch(kernel=Cloth.fingertip_project,
+                  dim=self.numParticles,
+                  inputs=[self.invMass, self.anchorCount, self.anchorPos,
+                          self.anchorDelta, self.prevPos, self.pos,
+                          self.pushLimit])
         wp.launch(kernel=Cloth.advance_sphere,
                   dim=1,
                   inputs=[self.colliderCenter, self.colliderRadius,
@@ -3233,16 +6590,35 @@ class Sphere(Input):
 
     def translate(self, dc: wp.vec3):
         c = self.center + dc
-        if c[1] < 0.0:
-            c[1] = 0.0
+        # Rest ON the floor, never through it: leave room for one cloth layer
+        # under the shell so squeezed fabric keeps an escape corridor. A center
+        # clamped at y=0 buries half the sphere and crushes cloth into negative
+        # space (unrecoverable entanglement).
+        floor_y = self.radius + self.dr + 2.0 * (thickness + particleRadius) + d_offset
+        if c[1] < floor_y:
+            c[1] = floor_y
             dc = c - self.center
         self.dc += dc
+        # Cap the per-frame sphere motion at what the (velocity-bounded) contact
+        # response can absorb: with bounded projections the fabric escapes a
+        # plowing sphere cleanly up to ~18 m/s (measured); beyond that it is
+        # transiently run over. 0.5/frame = 15 m/s at 30 fps -- an extreme flick
+        # already; faster gestures rubber-band.
+        l = wp.length(self.dc)
+        if l > 0.5:
+            self.dc = self.dc * (0.5 / l)
 
     def rotate(self, dq: wp.quat):
         self.dq = dq * self.dq
 
     def resize(self, dr: float):
         self.dr += dr
+        # A sphere inflated at low height must not grow through the floor:
+        # lift the center along with the shell (same margin as translate).
+        floor_y = self.radius + self.dr + 2.0 * (thickness + particleRadius) + d_offset
+        if self.center[1] + self.dc[1] < floor_y:
+            lift = wp.vec3(0.0, floor_y - self.center[1] - self.dc[1], 0.0)
+            self.dc += lift
 
     def render(self, **kwargs):
         if (not state & (State.RUN | State.STEP)
@@ -3725,6 +7101,33 @@ def ray_to_sphere(origin: wp.vec3, direction: wp.vec3, center: wp.vec3, radius: 
         return None
     d = wp.sqrt(d)
     return -b - d, -b + d
+
+
+def ray_to_cylinder(origin: wp.vec3, direction: wp.vec3, center: wp.vec3, radius: float) -> Optional[tuple[float, float]]:
+    # Ray vs the INFINITE cylinder along the world-z axis through (center.x,
+    # center.y): the sphere quadratic on the xy projection. Rays near-parallel
+    # to the axis (a ~ 0) are treated as a miss -- from the app camera they only
+    # occur when aiming almost exactly along the rod, where no depth clamp is
+    # meaningful.
+    mx = origin[0] - center[0]
+    my = origin[1] - center[1]
+    a = direction[0] * direction[0] + direction[1] * direction[1]
+    if a < 1.0e-12:
+        return None
+    b = mx * direction[0] + my * direction[1]
+    c = mx * mx + my * my - radius * radius
+    d = b * b - a * c
+    if d < 0.0:
+        return None
+    d = math.sqrt(d)
+    return (-b - d) / a, (-b + d) / a
+
+
+def ray_to_collider(origin: wp.vec3, direction: wp.vec3, center: wp.vec3, radius: float) -> Optional[tuple[float, float]]:
+    # Dispatch on the compile-time collider kind (see COLLIDER_KIND).
+    if colliderKind == 1:
+        return ray_to_cylinder(origin, direction, center, radius)
+    return ray_to_sphere(origin, direction, center, radius)
 
 
 def quat_fraction(q: wp.quat, f: float) -> wp.quat:
